@@ -16,13 +16,19 @@ cd ~/cs477_ws/src/
 ~~~~
 
 Let's copy the the class repo, install dependencies, and build it!
+Please ensure that you have generated an SSH key on your local machine and registered it to your GitHub account.
 ~~~~bash
-git clone https://github.com/pidipidi/cs477_IIR.git cs477_IIR
+git clone https://github.com/pidipidi/CS477_IIR_2026S.git cs477_IIR
 cd ..
 
 # for AMD architecture user,
 source ./src/cs477_IIR/install.sh
-# for ARM architecture user,
+~~~~
+
+For ARM architecture user, please build **Gazebo** from source before running the installation script.
+
+[Gazebo build guide for ARM user](docs/arm_gazebo_install.md)
+~~~~bash
 source ./src/cs477_IIR/install_arm.sh
 ~~~~
 
