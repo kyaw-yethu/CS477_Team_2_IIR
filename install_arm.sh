@@ -38,9 +38,9 @@ source /opt/ros/humble/setup.bash
 rosdep install -i --from-path src --rosdistro humble --skip-keys gazebo_grasp_plugin gazebo_version_helpers roboticsgroup_upatras_gazebo_plugins -y -r
 
 # # # Install binary packages
-sudo dpkg -i --ignore-depends=ros-humble-gazebo-ros,gazebo,libgazebo11 ./src/cs477_IIR/ros-humble-gazebo-grasp-plugin_1.0.2-0jammy_arm64.deb
-sudo dpkg -i --ignore-depends=ros-humble-gazebo-ros,gazebo,libgazebo11 ./src/cs477_IIR/ros-humble-gazebo-version-helpers_0.0.0-0jammy_arm64.deb
-sudo dpkg -i --ignore-depends=ros-humble-gazebo-ros,gazebo,libgazebo11 ./src/cs477_IIR/ros-humble-roboticsgroup-upatras-gazebo-plugins_0.2.0-0jammy_arm64.deb 
+sudo dpkg -i ./src/cs477_IIR/ros-humble-gazebo-grasp-plugin_1.0.2-0jammy_arm64.deb
+sudo dpkg -i ./src/cs477_IIR/ros-humble-gazebo-version-helpers_0.0.0-0jammy_arm64.deb
+sudo dpkg -i ./src/cs477_IIR/ros-humble-roboticsgroup-upatras-gazebo-plugins_0.2.0-0jammy_arm64.deb 
 
 colcon build --symlink-install --packages-ignore gazebo_plugins realsense_gazebo_plugin 
 colcon build --symlink-install --packages-select gazebo_plugins realsense_gazebo_plugin  --parallel-workers=1 --cmake-args -DCMAKE_CXX_FLAGS="--param ggc-min-expand=20" --cmake-args -DBUILD_TESTING=OFF
