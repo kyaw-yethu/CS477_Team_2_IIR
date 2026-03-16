@@ -4,6 +4,15 @@ Let's first install Turtlebot3, a mobile robot, which can run on a physics based
 ~~~~bash
 sudo apt install ros-humble-turtlebot3*
 ~~~~
+For ARM64 users, clone the TurtleBot3-related repositories from GitHub.
+~~~~bash
+cd ~/cs477_ws/src
+git clone -b humble https://github.com/ROBOTIS-GIT/turtlebot3.git
+git clone -b humble https://github.com/ROBOTIS-GIT/turtlebot3_msgs.git
+git clone -b humble https://github.com/ROBOTIS-GIT/turtlebot3_simulations.git
+cd ~/cs477_ws
+colcon build --symlink-install --packages-select turtlebot3_gazebo turtlebot3_teleop turtlebot3_description turtlebot3_msgs
+~~~~
 
 Select a turtlebot model
 ~~~~bash
