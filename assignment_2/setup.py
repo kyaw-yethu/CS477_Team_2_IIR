@@ -19,8 +19,8 @@ setup(
     license='TODO: License declaration',
     entry_points={
         'console_scripts': [
-            'min_jerk = assignment_2.solution.min_jerk:main',
-            'move_joint = assignment_2.solution.move_joint:main',
+            'min_jerk = assignment_2.min_jerk:main',
+            'move_joint = assignment_2.move_joint:main',
             'add_object = assignment_2.add_object:main',
             'move_astar = assignment_2.move_astar:main',
         ],
