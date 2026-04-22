@@ -26,8 +26,8 @@ JOINT_NAMES = ['shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
                'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint']
 
 
-
 def send_command(node, theta, duration=3):
+    # Sends a command to move the robot's joints to a specified angle.
     
     # construct a goal message
     g = FollowJointTrajectory.Goal()

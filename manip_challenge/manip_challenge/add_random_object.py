@@ -52,7 +52,7 @@ MODEL_LIST = {
     "meat_can": 2,
     #"mustard_bottle": 1,
     "hammer": 1,
-    "banana": 2,
+    "banana": 1,
 }
 
 # Random spawn bounds (meters) in world/bin frame

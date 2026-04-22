@@ -1,22 +1,46 @@
+#!/usr/bin/env python3
+"""
+Copyright 2020 Daehyung Park
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+"""
+
+import os
+import re
+
+import cv2
 import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import Image
-from geometry_msgs.msg import Point, Quaternion, Pose
-from riro_srvs.srv import StringPose
 from cv_bridge import CvBridge
+from geometry_msgs.msg import Pose
 from google import genai
 from PIL import Image as PILImage
-import cv2
-import re
 from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.node import Node
+from riro_srvs.srv import StringPose
+from sensor_msgs.msg import Image
 
 class GeminiPromptServiceNode(Node):
     def __init__(self):
         super().__init__('gemini_prompt_service_node')
         
         # 1. API Setup
-        self.declare_parameter('api_key', "AIzaSyDU3CEUJZNqluNDmM8XT2b_ovv8AaJ-uo8")
-        api_key = self.get_parameter('api_key').get_parameter_value().string_value
+        self.declare_parameter('api_key', '')
+        api_key = os.getenv('GEMINI_API_KEY')
+
+        if not api_key:
+            api_key = self.get_parameter('api_key').get_parameter_value().string_value
+
+        if not api_key:
+            raise ValueError(
+                "Gemini API key is not set. Please set the GEMINI_API_KEY environment variable "
+                "or provide the 'api_key' ROS parameter."
+            )
 
         self.client = genai.Client(api_key=api_key)
         self.model  = 'gemini-2.5-flash'

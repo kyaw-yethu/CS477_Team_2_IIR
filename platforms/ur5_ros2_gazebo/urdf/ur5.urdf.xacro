@@ -153,7 +153,7 @@
     <link name="wrist_camera_base_link">
       <visual>
         <geometry>
-          <mesh filename="file://$(find robotiq_85_description)/meshes/visual/d435_UR5_camera_mount.dae" scale="0.001 0.001 0.001"/>
+          <mesh filename="file://$(find ur5_ros2_gazebo)/urdf/sensors/meshes/d435_UR5_camera_mount.dae" scale="0.001 0.001 0.001"/>
         </geometry>                
       </visual>
       <!-- <collision>
@@ -171,7 +171,7 @@
     </link>
 
     <xacro:sensor_d435 name="wrist_camera" topics_ns="wrist_camera" parent="wrist_camera_base_link" >
-      <origin xyz="0.0 0.08 0.015" rpy="1.575796 -1.575796 0"/>
+      <origin xyz="0.0 0.06 0.015" rpy="-1.575796 -1.575796 0"/>
     </xacro:sensor_d435>
     
   </xacro:if>

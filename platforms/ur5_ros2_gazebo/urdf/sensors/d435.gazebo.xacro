@@ -35,6 +35,13 @@ This is the Gazebo URDF model for the Intel RealSense D435 camera
             <height>480</height>
             <format>RGB_INT8</format>
           </image>
+          <lens>
+            <intrinsics>
+              <fx>463.8</fx> <fy>463.8</fy>
+              <cx>320.0</cx> <cy>240.0</cy>
+              <s>0</s>
+            </intrinsics>
+          </lens>
           <clip>
             <near>0.1</near>
             <far>100</far>
@@ -95,11 +102,19 @@ This is the Gazebo URDF model for the Intel RealSense D435 camera
       </sensor>
       <sensor name="${camera_name}depth" type="depth">
         <camera name="${camera_name}">
-          <horizontal_fov>${85.2*deg_to_rad}</horizontal_fov>
+          <horizontal_fov>${69.4*deg_to_rad}</horizontal_fov>
+          <!-- <horizontal_fov>${85.2*deg_to_rad}</horizontal_fov> -->
           <image>
             <width>640</width>
             <height>480</height>
           </image>
+          <lens>
+            <intrinsics>
+              <fx>463.8</fx> <fy>463.8</fy>
+              <cx>320.0</cx> <cy>240.0</cy>
+              <s>0</s>
+            </intrinsics>
+          </lens>
           <clip>
             <near>0.1</near>
             <far>100</far>

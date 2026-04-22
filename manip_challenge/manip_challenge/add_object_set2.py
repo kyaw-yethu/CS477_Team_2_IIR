@@ -64,13 +64,11 @@ def main():
         node.get_logger().info("...connected!")
     
     # Spawn object
-    spawn_sdf_object(node, client, 'book', [0.52,0.2,0.6, 0, 0, np.pi/4.])
-    spawn_sdf_object(node, client, 'eraser', [0.52,-0.2,0.6, 0, 0, np.pi/2.])
-    spawn_sdf_object(node, client, 'snacks', [0.72,0.3,0.6, 0, 0, np.pi/4.])
-    spawn_sdf_object(node, client, 'soap2', [0.72,-0.1,0.6, 0, 0, np.pi/4.])
-    spawn_sdf_object(node, client, 'biscuits', [0.72,-0.3,0.6, 0, 0, np.pi/4.])
-    spawn_sdf_object(node, client, 'glue', [0.52, 0.,0.6, 0, 0, np.pi/4.])
-    spawn_sdf_object(node, client, 'soap', [0.72,0.1,0.6, 0, 0, -np.pi/4.])
+    spawn_sdf_object(node, client, 'coke_can', [0.55,0.25,0.6, 0, 0, 0])
+    spawn_sdf_object(node, client, 'strawberry', [0.5,-0.15,0.6, 0, 0, 0])
+    spawn_sdf_object(node, client, 'meat_can', [0.5,0.0,0.6, 0, 0, 0])
+    spawn_sdf_object(node, client, 'hammer', [0.5,0.15,0.6, 0, 0, np.pi/2])
+    spawn_sdf_object(node, client, 'banana', [0.7,-0.2,0.6, 0, 0, -np.pi/2])
 
     node.get_logger().info("Done! Shutting down node.")
     node.destroy_node()
