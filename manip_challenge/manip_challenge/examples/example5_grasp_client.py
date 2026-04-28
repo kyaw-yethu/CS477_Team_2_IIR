@@ -142,7 +142,7 @@ def main():
     parser.add_argument(
         "prompt",
         nargs="?",
-        default="Detect a banana and return [ymin, xmin, ymax, xmax, label]",
+        default="Detect a meat can and return [ymin, xmin, ymax, xmax, label]",
         help='Text prompt to send to the detection service.',
     )
     args = parser.parse_args(cli_args)
