@@ -27,7 +27,7 @@ ros2 launch ur5_ros2_moveit2 ur5.launch.py
 
 Check the tutorial slides!
 
-
-
+## Quiz
+Please submit two images showing the scenes before and after collision-avoidance planning. You must upload both images through KLMS.
 
 
