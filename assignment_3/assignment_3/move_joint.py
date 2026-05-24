@@ -98,11 +98,11 @@ class ActionClient(Node):
             #--------------------------------------------------
             # Design your (serial or parallel) PID controller
             # TODO : erase solution code
-            pos_err = 
-            vel_err = 
+            pos_err = des_angles[0] - pos
+            vel_err = 0 - vel
 
             # Execute "action"
-            action_msg.data = 
+            action_msg.data = [float(Kp * pos_err + Kd * vel_err)]
             #--------------------------------------------------
             self._pub.publish(action_msg)
 
@@ -129,14 +129,12 @@ class ActionClient(Node):
         # Plot graph
         x, y = zip(*pos_array)
 
-        ## plt.figure(figsize=(10, 6))
-        ## plt.plot(x, y)
-        ## plt.xlabel('t')
-        ## plt.ylabel('/joint_states/position[0]')
-        ## plt.grid(True)
-        ## plt.show()
-
-            
+        # plt.figure(figsize=(10, 6))
+        # plt.plot(x, y)
+        # plt.xlabel('t')
+        # plt.ylabel('/joint_states/position[0]')
+        # plt.grid(True)
+        # plt.show()
                
 def main(args=None): # argv=sys.argv):
     
