@@ -27,7 +27,7 @@ Then, update dependencies using colcon
 deactivate 2>/dev/null || true
 unset PYTHONPATH PYTHONHOME VIRTUAL_ENV
 
-cd "your ROS2 workspace"
+cd ~cs477_WS
 source /opt/ros/humble/setup.bash
 rosdep update
 rosdep install --from-paths src --ignore-src --rosdistro=humble -y
@@ -43,7 +43,29 @@ source /opt/ros/humble/setup.bash
 source "your ROS2 workspace"/install/setup.bash
 export PYTHONPATH=/usr/lib/python3/dist-packages:$PYTHONPATH
 ~~~~
+run this between each run
+~~~~bash
+# Stop the ros2 daemon (the real culprit)
+ros2 daemon stop 2>/dev/null
+pkill -9 -f '_ros2_daemon'
+pkill -9 -f 'ros2cli'
 
+# Then everything else
+pkill -9 -f gzserver
+pkill -9 -f gzclient
+pkill -9 -f spawn_entity
+pkill -9 -f robot_state_publisher
+pkill -9 -f controller_manager
+pkill -9 -f ros2_control_node
+pkill -9 -f 'ros2 control'
+pkill -9 -f 'ros2 launch'
+
+sleep 3   # give sockets time to release
+
+# DDS shared memory
+rm -rf /dev/shm/fastrtps_* /dev/shm/sem.fastrtps_* 2>/dev/null
+rm -rf /tmp/fastrtps_* 2>/dev/null
+~~~~
 (Terminal 1) you can test the cartpole gym-gazebo2 by running a random action script:
 ~~~~bash
 python3 src/cs477_IIR/assignment_3/assignment_3/gazebo_cartpole_pid_v0.py -g -r

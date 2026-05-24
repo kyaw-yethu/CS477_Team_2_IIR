@@ -117,12 +117,12 @@ def test(arm):
         # Place your code here
         # ------------------------------------------------------
         # position
-        #p.position.x = ...
-        #p.position.y = ...
-        #p.position.z = ...
+        p.position.x = pos[0]
+        p.position.y = pos[1]
+        p.position.z = pos[2]
         
         # orientation (You can use the SLERP function in quaternion.py)
-        #p.orientation = ...
+        p.orientation = quaternion.slerp(start_pose.orientation, goal_pose.orientation, i/(len(pos_traj)-1))
         
         # ------------------------------------------------------
         pose_traj.append(p)

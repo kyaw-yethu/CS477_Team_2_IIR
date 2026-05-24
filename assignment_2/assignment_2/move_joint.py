@@ -245,16 +245,13 @@ class ArmClient(Node):
         # ------------------------------------------------------
         # Place your code here
         # ------------------------------------------------------
-        #for ... 
-        #    g.trajectory.points.append(
-        #        JointTrajectoryPoint(positions= ... ,
-        #                             velocities= ... ,
-        #                             time_from_start=Duration(sec=int(t),
-        #    nanosec=int((t-int(t))*1e9) )))
+        for i, t in enumerate(time): 
+           g.trajectory.points.append(
+               JointTrajectoryPoint(positions= pos[i],
+                                    velocities= vel[i],
+                                    accelerations= acc[i],
+                                    time_from_start=Duration(sec=int(t), nanosec=int((t-int(t))*1e9) )))
 
-
-
-        
         # ------------------------------------------------------
 
         self.send_goal(g)
@@ -277,7 +274,8 @@ class ArmClient(Node):
         
         # Get a start pose 
         start_pose = self.fk_request(self.js_joint_position, attach_tool=True)
-
+        print(f"start_pose: {start_pose}")
+        print(f"goal_pose: {goal_pose}")
         # Get a sequence of path variables from the min jerk trajectory planning
         time, progress, _, _, _, = mj.min_jerk([0], [1], duration)
 
@@ -289,12 +287,9 @@ class ArmClient(Node):
             # Place your code here
             # ------------------------------------------------------
             # position
-            #pose.position.x = ...
-            #pose.position.y = ...
-            #pose.position.z = ...
-
-
-            
+            pose.position.x = (1-p) * start_pose.position.x + p * goal_pose.position.x
+            pose.position.y = (1-p) * start_pose.position.y + p * goal_pose.position.y
+            pose.position.z = (1-p) * start_pose.position.z + p * goal_pose.position.z
             # ------------------------------------------------------
             poses.append(pose)
 
@@ -315,19 +310,22 @@ class ArmClient(Node):
             # Place your code here
             # ------------------------------------------------------
             # get delta position
-            
-                            
+            dx = poses[i].position.x - poses[i-1].position.x
+            dy = poses[i].position.y - poses[i-1].position.y
+            dz = poses[i].position.z - poses[i-1].position.z
+            delta_pos = np.array([dx, dy, dz]).reshape(3,1)
+
             # get a jacobian
-            J = self.arm_kdl.jacobian(q)
+            J = np.asarray(self.arm_kdl.jacobian(q))
             Jp = J[:3]
 
             # get a pseudo inverse of jacobian mtx
-            # J_inv = ...
+            J_inv = Jp.T @ np.linalg.inv(Jp @ Jp.T + 0.1**2 * np.eye(3)) 
             
 
             # get the joint angles via IK
-            # q = ...
-
+            dq = J_inv @ delta_pos
+            q = q + dq[:, 0]
             
             # ------------------------------------------------------
             
@@ -365,6 +363,9 @@ class ArmClient(Node):
         # Get a start pose 
         start_pose = self.fk_request(self.js_joint_position, attach_tool=True)
 
+        print(f"start_pose: {start_pose}")
+        print(f"goal_pose: {goal_pose}")
+
         # Get a sequence of path variables from the min jerk trajectory planning
         time, progress, _, _, _, = mj.min_jerk([0], [1], duration)
 
@@ -376,14 +377,12 @@ class ArmClient(Node):
             # Place your code here
             # ------------------------------------------------------
             # position (copy from move_position)
-            #pose.position.x = ...
-            #pose.position.y = ...
-            #pose.position.z = ...
-
-
+            pose.position.x = (1-p) * start_pose.position.x + p * goal_pose.position.x
+            pose.position.y = (1-p) * start_pose.position.y + p * goal_pose.position.y
+            pose.position.z = (1-p) * start_pose.position.z + p * goal_pose.position.z
             
             # orientation (use the SLERP function in the quaternion.py)
-            #pose.orientation = ...
+            pose.orientation = quaternion.slerp(start_pose.orientation, goal_pose.orientation, p)
             
             # ------------------------------------------------------
             
@@ -412,22 +411,30 @@ class ArmClient(Node):
             # Place your code here
             # ------------------------------------------------------
             # get delta position
-            # ...
+            d_p = frame.p - prev_frame.p
+            d_position = np.array([d_p[0], d_p[1], d_p[2]]).reshape(3,1)
             
             # get delta orientation
-            # ...
+            Rd = np.array([[frame.M[i,j] for j in range(3)] for i in range(3)])
+            R  = np.array([[prev_frame.M[i,j] for j in range(3)] for i in range(3)])
+            R_delta = Rd @ R.T
+            d_w = 0.5 * np.array([[R_delta[2,1] - R_delta[1,2]],
+                                [R_delta[0,2] - R_delta[2,0]],
+                                [R_delta[1,0] - R_delta[0,1]]])
 
+            # stack into 6-vector twist
+            delta = np.vstack([d_position, d_w])
             
             
             # get a jacobian
-            J = self.arm_kdl.jacobian(q)
+            J = np.asarray(self.arm_kdl.jacobian(q))
 
             # get a pseudo inverse of jacobian mtx
-            # J_inv = ...
+            J_inv = J.T @ np.linalg.inv(J @ J.T + 0.1**2 * np.eye(6))
 
-            # get the joint angles given delta position and orientation
-            # ...
-            # q = ...
+            # get the joint angles
+            dq = J_inv @ delta
+            q = q + dq[:, 0]
 
             
             # ------------------------------------------------------
@@ -441,7 +448,7 @@ class ArmClient(Node):
 
             joint_position_traj.append(q.tolist())
             joint_velocity_traj.append(np.array(dq)[:,0].tolist())
-            
+
             
         self.send_goal(g)
         return time, np.array(joint_position_traj), np.array(joint_velocity_traj), None, None
@@ -488,24 +495,28 @@ class ArmClient(Node):
             # ------------------------------------------------------
             # Place your code here
             # ------------------------------------------------------
-            # get delta position
-            # ...
+            d_p = frame.p - prev_frame.p
+            d_position = np.array([d_p[0], d_p[1], d_p[2]]).reshape(3,1)
             
             # get delta orientation
-            # ...
+            Rd = np.array([[frame.M[i,j] for j in range(3)] for i in range(3)])
+            R  = np.array([[prev_frame.M[i,j] for j in range(3)] for i in range(3)])
+            R_delta = Rd @ R.T
+            d_w = 0.5 * np.array([[R_delta[2,1] - R_delta[1,2]],
+                                [R_delta[0,2] - R_delta[2,0]],
+                                [R_delta[1,0] - R_delta[0,1]]])
 
-
+            delta = np.vstack([d_position, d_w])
             
-                            
             # get a jacobian
-            J = self.arm_kdl.jacobian(q)
+            J = np.asarray(self.arm_kdl.jacobian(q))
 
             # get a pseudo inverse of jacobian mtx
-            # ...
+            J_inv = J.T @ np.linalg.inv(J @ J.T + 0.1**2 * np.eye(6))
 
-            # get the joint angles via IK
-            # ...
-            # q = ...
+            # get the joint angles
+            dq = J_inv @ delta
+            q = q + dq[:, 0]
 
             
             # ------------------------------------------------------
@@ -569,7 +580,7 @@ def problem_1d(arm):
     time.sleep(4.0)
 
     # Move to the goal pose
-    goal_pose = Pose()
+    goalc_pose = Pose()
     goal_pose.position.x = 0.486899
     goal_pose.position.y = 0.112149-0.3
     goal_pose.position.z = 0.273859

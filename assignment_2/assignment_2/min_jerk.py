@@ -56,13 +56,20 @@ def min_jerk(start, goal, dur, freq=100):
         # ------------------------------------------------------
         # Place your code here
         # ------------------------------------------------------
-        #t = 
+        t = i / freq # 0 to dur (in seconds) eg. i=freq => t=1s
+        traj_frac = t / dur # 0 to 1 (percentage of the trajectory)
 
+        x_t = start + (goal - start) * (10*(traj_frac)**3 - 15*(traj_frac)**4 + 6*(traj_frac)**5)
+        xd_t = (goal - start) * (30*(traj_frac)**2 - 60*(traj_frac)**3 + 30*(traj_frac)**4) / dur
+        xdd_t = (goal - start) * (60*(traj_frac) - 180*(traj_frac)**2 + 120*(traj_frac)**3) / dur**2
+        xddd_t = (goal - start) * (60 - 360*(traj_frac)**1 + 360*(traj_frac)**2) / dur**3
+        
+        
         time.append(t)
-        #X.append( )
-        #Xd.append( )
-        #Xdd.append( )
-        #Xddd.append( )
+        X.append(x_t)
+        Xd.append(xd_t)
+        Xdd.append(xdd_t)
+        Xddd.append(xddd_t)
         # ------------------------------------------------------
 
     return time, np.array(X), np.array(Xd), np.array(Xdd), np.array(Xddd)
@@ -114,4 +121,3 @@ def main(args=None):
     
 if __name__ == '__main__':
     main()
-
