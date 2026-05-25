@@ -20,7 +20,7 @@ from trajectory_msgs.msg import JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
 
 import numpy as np
-from assignment_1 import move_joint
+from assignment_1 import move_joint, forward_kin
 
 JOINT_NAMES = ['shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
                'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint']
@@ -45,16 +45,18 @@ def move_position(node, goal_pose, init_joint=None):
     # ADD YOUR CODE
     #------------------------------------------------------------
     # 1) construct forward kinematics (problem 1)
-
+    forward_kinematics = forward_kin.your_forward_kinematics
     
     # 2) Get the start position from the init_joint via forward kinematics
-
-    
+    start_pose = forward_kinematics(init_joint)
+    start_position = [start_pose.position.x, start_pose.position.y, start_pose.position.z]
+    # print(f"Start position: {start_position}")
     # 3) Get the goal position from the goal_pose
-    
-    
+    goal_position = [goal_pose.position.x, goal_pose.position.y, goal_pose.position.z]
+    # print(f"Goal position: {goal_position}")
+
     # 4) Get a pose/position trajectory from start to goal positions
-    #pose_traj =
+    pose_traj = np.linspace(start_position, goal_position, 101)
 
     
     # construct a goal message
@@ -63,40 +65,82 @@ def move_position(node, goal_pose, init_joint=None):
     g.trajectory.joint_names = JOINT_NAMES
         
     # Get a sequence of joint angles that track the position trajecotory
-    q = init_joint
+    q = np.array(init_joint, dtype=float)
+    print(f"At 0% of the trajectory, q = {q}")
     dt = 0.05
+    _lambda = 0.1
     time_from_start = 0
-    #for i in range(1, len(pose_traj)):
-        
-        # Find a Jacobian
-        # J = 
-        # J_p = J[:3]
+    for i in range(1, len(pose_traj)):
+        # Recompute forward kinematics at current q
+        _, transforms = forward_kinematics(q, return_transforms=True)
 
-        # Take Pseudo inverse
-        # J_inv = 
+        # Find a Jacobian
+        T10 = transforms[0]
+        T20 = T10 @ transforms[1]
+        T30 = T20 @ transforms[2]
+        T40 = T30 @ transforms[3]
+        T50 = T40 @ transforms[4]
+        T60 = T50 @ transforms[5]
+
+        a1_local = np.array([0, 0, 1])
+        a2_local = np.array([0, 1, 0])
+        a3_local = np.array([0, 0, 1])
+        a4_local = np.array([0, 0, 1])
+        a5_local = np.array([0, 1, 0])
+        a6_local = np.array([0,-1, 0])
+
+        z0 = a1_local                       # joint 1 axis in base
+        z1 = T10[:3,:3] @ a2_local          # joint 2 axis in base
+        z2 = T20[:3,:3] @ a3_local          # joint 3
+        z3 = T30[:3,:3] @ a4_local          # joint 4
+        z4 = T40[:3,:3] @ a5_local          # joint 5
+        z5 = T50[:3,:3] @ a6_local          # joint 6
+
+        o0 = np.array([0, 0, 0])       # base frame origin
+        o1 = T10[:3, 3]
+        o2 = T20[:3, 3]
+        o3 = T30[:3, 3]
+        o4 = T40[:3, 3]
+        o5 = T50[:3, 3]
+        o6 = T60[:3, 3]                # end-effector
+
+        J_p = np.array([
+            np.cross(z0, o6 - o0),
+            np.cross(z1, o6 - o1),
+            np.cross(z2, o6 - o3),   
+            np.cross(z3, o6 - o4),
+            np.cross(z4, o6 - o4),
+            np.cross(z5, o6 - o5),
+        ]).T
+        J_o = np.array([z0, z1, z2, z3, z4, z5]).T
+        J = np.vstack((J_p, J_o))
+        J_inv = J_p.T @ np.linalg.inv(J_p @ J_p.T + _lambda**2 * np.eye(3)) 
+
+        if i == 1:
+            print(f"J_p: {J_p}")
+            print(f"psudo inverse of J: {J_inv}")
 
         # Compute a delta position
-        # dx =
+        dx = pose_traj[i] - pose_traj[i-1]
 
-        # Compute a delta theta        
-        # dtheta =
+        # Compute a delta theta
+        dtheta = J_inv @ dx
 
         # Compute a desired theta
-        #q = 
-        #time_from_start = time_from_start + dt
-        #g.trajectory.points.append(
-        #    JointTrajectoryPoint(positions=q, velocities=[0]*6,
-        #                         time_from_start=Duration(sec=int(time_from_start),
-        #    nanosec=int((time_from_start-int(time_from_start))*1e9)))
-        #    )
-        
+        q += dtheta
 
+        if i in [25, 50, 75, 100]:
+             print(f"At {i}% of the trajectory, q = {q}")
 
+        time_from_start += dt
+        g.trajectory.points.append(
+           JointTrajectoryPoint(positions=q, velocities=[0]*6,
+                                time_from_start=Duration(sec=int(time_from_start),
+           nanosec=int((time_from_start-int(time_from_start))*1e9)))
+           )
     #------------------------------------------------------------
         
     move_joint.move_joint(node, g)
-
-
 
 
 def main(args=None):
@@ -136,6 +180,5 @@ def main(args=None):
 if __name__ == '__main__':
     main()
         
-
 
 
