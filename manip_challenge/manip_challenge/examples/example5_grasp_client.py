@@ -18,7 +18,7 @@ import time
 
 import numpy as np
 import rclpy
-from assignment_2.solution import move_joint_sol as mj
+from assignment_2 import move_joint as mj
 from geometry_msgs.msg import PoseStamped
 from manip_challenge import move_gripper
 from rclpy.node import Node

@@ -1,0 +1,27 @@
+# Shared + per-node parameters for the team_2 minimal pipeline.
+# Values below are LOCAL-DEV-SAFE (AMD laptop, CPU). On the CUDA test server,
+# device='auto' already picks cuda; for the LLM, rebuild with the cu124
+# llama-cpp wheel + set n_gpu_layers: -1.
+
+/**:
+  ros__parameters:
+    parsed_tasks_topic: /parsed_tasks
+
+instruction_parser:
+  ros__parameters:
+    task_command_topic: /task_commands
+    qwen_gguf: /models/qwen2.5-7b-instruct-q4_k_m.gguf
+    n_ctx: 4096
+    n_gpu_layers: 0        # CPU. Set -1 on the CUDA server to offload all layers.
+    temperature: 0.0
+
+perception_node:
+  ros__parameters:
+    image_topic: /wrist_camera/wrist_camera/color/image_raw
+    detections_topic: /detections
+    gdino_dir: /models/grounding-dino-base
+    box_threshold: 0.25    # object-presence confidence; raise to cut false boxes.
+    text_threshold: 0.25   # query-match strength; raise if wrong labels stick.
+    device: auto           # auto -> cuda if available else cpu.
+    save_annotated: true   # write annotated frames to disk for debugging.
+    annotated_dir: /models/detections  # HOST-mounted -> appears on host directly.

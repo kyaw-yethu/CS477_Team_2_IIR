@@ -14,10 +14,10 @@ import rclpy
 import rclpy.node
 
 from pykdl_utils.kdl_kinematics import create_kdl_kin
-from assignment_1 import misc
 from hrl_geom.pose_converter import PoseConv
 import os
 import xacro
+from . import misc
 from ament_index_python.packages import get_package_share_directory
 
 from manip_challenge import get_joint

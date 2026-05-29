@@ -1,0 +1,11 @@
+# Request: a JSON array of class names to detect, e.g.
+#   ["coke can", "banana", "meat can"]
+# (The perception node also accepts a {"tasks":[{"object":...}]} object.)
+string data
+---
+# Response: a JSON object matching the existing /detections contract:
+#   {"detections": [{"object": str,
+#                    "bbox":   [x1, y1, x2, y2],
+#                    "center": [cx, cy],
+#                    "conf":   float}, ...]}
+string data
