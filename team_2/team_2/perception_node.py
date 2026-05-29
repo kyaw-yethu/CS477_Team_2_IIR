@@ -80,7 +80,7 @@ class PerceptionNode(Node):
         super().__init__('perception_node')
 
         # --- API / model ----------------------------------------------------
-        self.declare_parameter('api_key', 'AIzaSyAPaChljhSYqrr43SibBFs4N4tZ0fUg8Xk')
+        self.declare_parameter('api_key', '')
         # example4 used 'gemini-2.5-flash' for detection; example5 used
         # 'gemini-3.1-flash-lite-preview'. Switch here via param if you like.
         self.declare_parameter('model', 'gemini-2.5-flash')
