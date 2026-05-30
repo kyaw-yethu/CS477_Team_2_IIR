@@ -10,6 +10,9 @@
 frames.pdf
 frames.gv
 *.jpeg
+.venv
+venv
+*.egg-info
 
 # ROS specific files and folders #
 ##################################
