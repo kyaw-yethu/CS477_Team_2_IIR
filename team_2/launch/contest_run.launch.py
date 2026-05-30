@@ -3,7 +3,7 @@
 contest_run.launch.py
 
 Brings up the team_2 system in STANDBY:
-  - instruction_parser : /task_commands -> Qwen      -> /parsed_tasks
+     - instruction_parser : /task_commands -> Gemini API -> /parsed_tasks
   - perception_node    : serves 'detect_objects' (Grounding DINO, 2D boxes)
   - grasp_server       : serves 'lift_bbox_to_3d'  (bbox -> 3D pose; depth/cloud)
   - orchestrator_node  : owns the arm; consumes /parsed_tasks and drives the

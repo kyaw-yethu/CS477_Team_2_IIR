@@ -2,6 +2,16 @@ Build docker image.
 ~~~bash
 sudo docker build -t image_team_2 .
 ~~~
+Build docker image with GEMINI_API_KEYS from .env included init.
+~~~bash
+set -a
+source ./team_2/.env
+set +a
+
+sudo docker build --no-cache \
+  --build-arg GEMINI_API_KEYS="$GEMINI_API_KEYS" \
+  -t image_team_2 .
+~~~
 Run a container.
 ~~~~bash
 sudo docker run -it --rm --net=host --ipc=host\

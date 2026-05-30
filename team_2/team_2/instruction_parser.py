@@ -3,9 +3,9 @@
 instruction_parser.py
 
 STANDBY node. Subscribes to /task_commands (std_msgs/String), parses the
-free-form instruction into a list of (object, destination) pairs using a local
-Qwen 2.5 GGUF model (llama-cpp-python), and republishes the structured result
-as JSON on /parsed_tasks for the perception node to consume.
+free-form instruction into a list of (object, destination) pairs using the
+Gemini API, and republishes the structured result as JSON on /parsed_tasks for
+the perception node to consume.
 
 Example in:  "Move the banana and the meat can to the left storage.
               Move the coke can on the shelf."
@@ -23,7 +23,7 @@ from rclpy.qos import (QoSProfile, ReliabilityPolicy, HistoryPolicy,
                        DurabilityPolicy)
 from std_msgs.msg import String
 
-from llama_cpp import Llama
+from google import genai
 
 
 SYSTEM_PROMPT = """You are a task parser for a robot pick-and-place system.
@@ -50,28 +50,21 @@ VALID_DEST = {"left_storage", "right_storage", "shelf"}
 class InstructionParser(Node):
     def __init__(self):
         super().__init__('instruction_parser')
-        
-        self.declare_parameter(
-            'qwen_gguf',
-            os.getenv('QWEN_GGUF',
-                      '/models/qwen2.5-7b-instruct-q4_k_m.gguf'))
+
+        self.declare_parameter('model', 'gemini-2.5-flash')
         self.declare_parameter('task_command_topic', '/task_commands')
         self.declare_parameter('parsed_tasks_topic', '/parsed_tasks')
-        self.declare_parameter('n_ctx', 4096)
-        self.declare_parameter('n_gpu_layers', 0)   # -1 = all layers on GPU
         self.declare_parameter('temperature', 0.0)
 
-        gguf = self.get_parameter('qwen_gguf').value
-        n_ctx = int(self.get_parameter('n_ctx').value)
-        ngl = int(self.get_parameter('n_gpu_layers').value)
+        self.model = self.get_parameter('model').value
         self.temperature = float(self.get_parameter('temperature').value)
 
-        # Pointing llama.cpp at shard 00001-of-00002 is enough; it auto-loads
-        # the remaining shards that sit next to it.
-        self.get_logger().info(f'Loading Qwen GGUF: {gguf} (n_gpu_layers={ngl})')
-        self.llm = Llama(model_path=gguf, n_ctx=n_ctx,
-                         n_gpu_layers=ngl, verbose=False)
-        self.get_logger().info('Qwen model loaded.')
+        self._api_keys = self._load_api_keys()
+        self._client_index = 0
+        self._clients = [genai.Client(api_key=key) for key in self._api_keys]
+
+        self.get_logger().info(
+            f'Gemini parser ready, model={self.model}, keys={len(self._clients)}')
 
         # Must match the publisher in example3_task_command_pub (RELIABLE).
         cmd_qos = QoSProfile(
@@ -97,6 +90,20 @@ class InstructionParser(Node):
         self.get_logger().info(
             'instruction_parser: STANDBY (waiting on /task_commands)')
 
+    def _load_api_keys(self):
+        env_keys = os.getenv('GEMINI_API_KEYS', '')
+        if not env_keys:
+            raise ValueError(
+                'Gemini API keys are not set. Set the GEMINI_API_KEYS '
+                'environment variable.')
+
+        return env_keys.split(',')
+
+    def _next_client(self):
+        client = self._clients[self._client_index]
+        self._client_index = (self._client_index + 1) % len(self._clients)
+        return client
+
     def on_command(self, msg):
         # NOTE: inference runs inline here for simplicity. It blocks this node's
         # executor for a few seconds; fine for a one-shot command. If you later
@@ -118,16 +125,27 @@ class InstructionParser(Node):
             self._busy.release()
 
     def parse(self, instruction):
-        out = self.llm.create_chat_completion(
-            messages=[
-                {'role': 'system', 'content': SYSTEM_PROMPT},
-                {'role': 'user', 'content': instruction},
-            ],
-            response_format={'type': 'json_object'},  # grammar-constrained JSON
-            temperature=self.temperature,
-        )
-        raw = out['choices'][0]['message']['content']
-        data = json.loads(raw)
+        last_error = None
+        for _ in range(len(self._clients)):
+            client = self._next_client()
+            try:
+                out = client.models.generate_content(
+                    model=self.model,
+                    contents=[
+                        SYSTEM_PROMPT,
+                        f'Instruction: {instruction}',
+                        'Return only JSON.'
+                    ],
+                )
+                raw = (out.text or '').strip()
+                data = json.loads(raw)
+                break
+            except Exception as e:
+                last_error = e
+                self.get_logger().warn(
+                    f'Gemini parse attempt failed, rotating key: {e}')
+        else:
+            raise last_error
 
         tasks = []
         for t in data.get('tasks', []):

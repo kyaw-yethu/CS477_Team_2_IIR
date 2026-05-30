@@ -10,6 +10,8 @@
 # =============================================================================
 FROM osrf/ros:humble-desktop
 
+ARG GEMINI_API_KEYS=
+
 # ---- Static environment -----------------------------------------------------
 ENV DEBIAN_FRONTEND=noninteractive
 # Match the host's RMW so DDS discovery works over --net=host.
@@ -60,14 +62,6 @@ RUN pip install --no-cache-dir --ignore-installed torch torchvision \
 # used to bake the weights below.
 RUN pip install --no-cache-dir -U transformers huggingface_hub
 
-# ---- Python: LLM — Qwen 2.5 via llama-cpp-python ----------------------------
-# CPU wheel (runs on the laptop). For the CUDA server, comment this out and use
-# the cu124 wheel below for GPU offload.
-RUN pip install --no-cache-dir llama-cpp-python \
-      --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
-# RUN pip install --no-cache-dir llama-cpp-python \
-#       --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
-
 # ---- Pin numpy < 2 ----------------------------------------------------------
 # MUST be the LAST pip step so no transitive dependency can bump numpy back to
 # 2.x (which breaks ROS2 and the system matplotlib).
@@ -81,13 +75,6 @@ RUN pip install --no-cache-dir --force-reinstall "numpy<2"
 #     hf download IDEA-Research/grounding-dino-base \
 #       --local-dir /models/grounding-dino-base
 ENV GDINO_DIR=/models/grounding-dino-base
-
-# Qwen GGUF: bake it the same way for the final image, or keep mounting /models
-# as a volume during dev. NOTE: the official Qwen repo ships q4_k_m SPLIT into
-# two shards; for a single self-contained file use bartowski's merged copy.
-# RUN hf download bartowski/Qwen2.5-7B-Instruct-GGUF \
-#       --include "Qwen2.5-7B-Instruct-Q4_K_M.gguf" --local-dir /models
-ENV QWEN_GGUF=/models/Qwen2.5-7B-Instruct-Q4_K_M.gguf
 
 # ---- Workspace: source + build ----------------------------------------------
 WORKDIR /ros2_ws
@@ -112,6 +99,7 @@ RUN . /opt/ros/humble/setup.sh && \
 COPY manip_challenge/disable_shm.xml /root/.fastdds_disable_shm.xml
 ENV FASTRTPS_DEFAULT_PROFILES_FILE=/root/.fastdds_disable_shm.xml
 ENV ROS_DOMAIN_ID=11
+ENV GEMINI_API_KEYS=${GEMINI_API_KEYS}
 # Force transformers/HF to load only the baked weights — never hit the network
 # at runtime (the competition server may be fully offline).
 ENV HF_HUB_OFFLINE=1
