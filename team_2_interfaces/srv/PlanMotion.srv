@@ -1,0 +1,7 @@
+# Request: Cartesian goal pose and execution flag
+geometry_msgs/Pose goal_pose
+bool execute
+---
+# Response: Joint trajectory if successful, with success flag
+trajectory_msgs/JointTrajectory trajectory
+bool success

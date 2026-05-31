@@ -38,6 +38,9 @@ def generate_launch_description():
         # SEAM 5: the bbox -> 3D lift service (refactor of example5_grasp_server).
         Node(executable='grasp_server',
              name='grasp_server', **common),
+        # Motion planning service with MoveIt2 collision checking
+        Node(executable='motion_planner',
+             name='motion_planner', **common),
         Node(executable='orchestrator_node',
              name='orchestrator_node', **common),
     ])

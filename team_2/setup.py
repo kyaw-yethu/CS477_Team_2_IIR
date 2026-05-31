@@ -36,6 +36,7 @@ setup(
                     'perception_node = team_2.perception_node:main',
                     'orchestrator_node = team_2.orchestrator_node:main',
                     'grasp_server = team_2.grasp_server:main',
+                    'motion_planner = team_2.motion_planner:main',
                 ],
     },
 )
