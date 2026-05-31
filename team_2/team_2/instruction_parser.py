@@ -3,15 +3,19 @@
 instruction_parser.py
 
 STANDBY node. Subscribes to /task_commands (std_msgs/String), parses the
-free-form instruction into a list of (object, destination) pairs using a local
-Qwen 2.5 GGUF model (llama-cpp-python), and republishes the structured result
-as JSON on /parsed_tasks for the perception node to consume.
+free-form instruction into a list of (object, destination) pairs using the
+Gemini API (google-genai), and republishes the structured result as JSON on
+/parsed_tasks for the perception node to consume.
 
 Example in:  "Move the banana and the meat can to the left storage.
               Move the coke can on the shelf."
 Example out: {"tasks": [{"object": "banana",   "destination": "left_storage"},
                         {"object": "meat can", "destination": "left_storage"},
                         {"object": "coke can", "destination": "shelf"}]}
+
+Set your API key before launching:
+    export GEMINI_API_KEY="your_api_key"
+or pass it as the 'api_key' ROS parameter.
 """
 import os
 import json
@@ -23,7 +27,8 @@ from rclpy.qos import (QoSProfile, ReliabilityPolicy, HistoryPolicy,
                        DurabilityPolicy)
 from std_msgs.msg import String
 
-from llama_cpp import Llama
+from google import genai
+from google.genai import types
 
 
 SYSTEM_PROMPT = """You are a task parser for a robot pick-and-place system.
@@ -50,29 +55,33 @@ VALID_DEST = {"left_storage", "right_storage", "shelf"}
 class InstructionParser(Node):
     def __init__(self):
         super().__init__('instruction_parser')
-        
-        self.declare_parameter(
-            'qwen_gguf',
-            os.getenv('QWEN_GGUF',
-                      '/models/qwen2.5-7b-instruct-q4_k_m.gguf'))
+
+        # ---- Parameters --------------------------------------------------
+        api_key = os.getenv('GEMINI_API_KEY')
+        if not api_key:
+            api_key = self.get_parameter('api_key').get_parameter_value().string_value
+        self.declare_parameter('api_key', api_key)
+        self.declare_parameter('model', 'gemini-2.5-flash-lite')
         self.declare_parameter('task_command_topic', '/task_commands')
         self.declare_parameter('parsed_tasks_topic', '/parsed_tasks')
-        self.declare_parameter('n_ctx', 4096)
-        self.declare_parameter('n_gpu_layers', 0)   # -1 = all layers on GPU
         self.declare_parameter('temperature', 0.0)
 
-        gguf = self.get_parameter('qwen_gguf').value
-        n_ctx = int(self.get_parameter('n_ctx').value)
-        ngl = int(self.get_parameter('n_gpu_layers').value)
+        # ---- Gemini API setup (same pattern as example4/5) ---------------
+        api_key = os.getenv('GEMINI_API_KEY')
+        if not api_key:
+            api_key = self.get_parameter('api_key').get_parameter_value().string_value
+        if not api_key:
+            raise ValueError(
+                "Gemini API key is not set. Please set the GEMINI_API_KEY "
+                "environment variable or provide the 'api_key' ROS parameter."
+            )
+
+        self.client = genai.Client(api_key=api_key)
+        self.model = self.get_parameter('model').value
         self.temperature = float(self.get_parameter('temperature').value)
+        self.get_logger().info(f'Using Gemini model: {self.model}')
 
-        # Pointing llama.cpp at shard 00001-of-00002 is enough; it auto-loads
-        # the remaining shards that sit next to it.
-        self.get_logger().info(f'Loading Qwen GGUF: {gguf} (n_gpu_layers={ngl})')
-        self.llm = Llama(model_path=gguf, n_ctx=n_ctx,
-                         n_gpu_layers=ngl, verbose=False)
-        self.get_logger().info('Qwen model loaded.')
-
+        # ---- QoS ---------------------------------------------------------
         # Must match the publisher in example3_task_command_pub (RELIABLE).
         cmd_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -98,10 +107,10 @@ class InstructionParser(Node):
             'instruction_parser: STANDBY (waiting on /task_commands)')
 
     def on_command(self, msg):
-        # NOTE: inference runs inline here for simplicity. It blocks this node's
-        # executor for a few seconds; fine for a one-shot command. If you later
-        # need the node responsive during inference, move parse() onto a worker
-        # thread and publish from there.
+        # NOTE: the Gemini call runs inline here for simplicity. It blocks this
+        # node's executor for the duration of the request; fine for a one-shot
+        # command. If you later need the node responsive during inference, move
+        # parse() onto a worker thread and publish from there.
         if not self._busy.acquire(blocking=False):
             self.get_logger().warn('Already parsing a command; ignoring new one.')
             return
@@ -118,15 +127,16 @@ class InstructionParser(Node):
             self._busy.release()
 
     def parse(self, instruction):
-        out = self.llm.create_chat_completion(
-            messages=[
-                {'role': 'system', 'content': SYSTEM_PROMPT},
-                {'role': 'user', 'content': instruction},
-            ],
-            response_format={'type': 'json_object'},  # grammar-constrained JSON
-            temperature=self.temperature,
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=instruction,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                temperature=self.temperature,
+                response_mime_type='application/json',  # force JSON output
+            ),
         )
-        raw = out['choices'][0]['message']['content']
+        raw = response.text
         data = json.loads(raw)
 
         tasks = []

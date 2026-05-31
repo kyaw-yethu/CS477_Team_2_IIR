@@ -274,8 +274,8 @@ class ArmClient(Node):
         
         # Get a start pose 
         start_pose = self.fk_request(self.js_joint_position, attach_tool=True)
-        print(f"start_pose: {start_pose}")
-        print(f"goal_pose: {goal_pose}")
+        # print(f"start_pose: {start_pose}")
+        # print(f"goal_pose: {goal_pose}")
         # Get a sequence of path variables from the min jerk trajectory planning
         time, progress, _, _, _, = mj.min_jerk([0], [1], duration)
 
@@ -363,8 +363,8 @@ class ArmClient(Node):
         # Get a start pose 
         start_pose = self.fk_request(self.js_joint_position, attach_tool=True)
 
-        print(f"start_pose: {start_pose}")
-        print(f"goal_pose: {goal_pose}")
+        # print(f"start_pose: {start_pose}")
+        # print(f"goal_pose: {goal_pose}")
 
         # Get a sequence of path variables from the min jerk trajectory planning
         time, progress, _, _, _, = mj.min_jerk([0], [1], duration)

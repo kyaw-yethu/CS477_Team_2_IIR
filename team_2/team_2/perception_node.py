@@ -1,54 +1,57 @@
 #!/usr/bin/env python3
 """
-perception_node.py  (Gemini variant)
+perception_node.py  (Gemini, two-camera variant)
 
-STANDBY perception SERVICE. Caches the latest RGB frame from the wrist camera
-and exposes Gemini open-vocabulary detection as a service:
+STANDBY perception SERVICE. Caches the latest RGB frame from BOTH the fixed
+scene camera and the wrist camera, and exposes Gemini open-vocabulary detection
+as a service that runs on EITHER camera, selected per request:
 
     team_2_interfaces/srv/DetectObjects   (service name: 'detect_objects')
-        request.data  = JSON array of class names, e.g. ["coke can","banana"]
-                        (also accepts {"tasks":[{"object":...}, ...]})
-        response.data = {"detections":[{object,bbox,center,conf}, ...]}
 
-This is a DROP-IN replacement for the Grounding DINO version: the service name,
-the request/response JSON shapes, the bbox=[x1,y1,x2,y2] pixel convention, the
-/detections debug publish, and save_overlay() are all unchanged, so the
-orchestrator never knows the backend changed.
+      request.data  -- JSON, one of:
+          ["coke can", "banana"]                      # bare list -> default cam
+          {"classes": ["coke can"], "camera": "scene"}
+          {"tasks":   [{"object": "coke can", ...}], "camera": "wrist"}
 
-WHAT CHANGED vs the Grounding DINO node
-  - No torch / transformers / local weights. One network call per request to the
-    Gemini API instead.
-  - One call detects ALL requested classes and ALL their instances at once
-    (cheaper + faster than per-class, and naturally handles "same type appears
-    N times").
-  - Gemini gives no per-box confidence, so conf is fixed at 1.0. The
-    orchestrator's pick_target() then degenerates to "first matching detection"
-    (its `det['conf'] > best['conf']` test is never true when all are equal) —
-    fine here, since detection order from the model is arbitrary anyway.
+      response.data -- JSON:
+          {"camera": "scene",
+           "frame":  "camera_color_optical_frame",     # optical frame of that cam
+           "detections": [{object, bbox, center, conf}, ...]}
 
->>> RUNTIME REQUIREMENT: this node needs INTERNET + a Gemini API key. <<<
-    That breaks the "fully offline competition box" assumption the baked-in
-    Grounding DINO + Qwen design was built around. Confirm the competition
-    machine has network before relying on this. The instruction_parser (Qwen,
-    local) stays offline-capable; only perception now needs the network.
+WHY TWO CAMERAS (the geometry that forces this)
+  A bbox found in the SCENE image indexes SCENE pixels; it cannot be lifted to
+  3D with the WRIST depth (different sensor / FOV / pixels). So the competition
+  flow is two-stage:
 
-    Pass the key into the container, e.g.:
-        sudo docker run ... -e GEMINI_API_KEY="..." image_team_2
-    or set the 'api_key' ROS param via params.yaml.
+    1. scene detect  (arm clear, wide stable view)  -> WHAT is on the table and
+       roughly where. Lift those boxes with the SCENE point cloud to get coarse
+       base_link positions to drive the arm toward.
+    2. wrist detect  (arm moved close, oblique)     -> precise box on the target,
+       lifted with the WRIST point cloud for the actual grasp.
 
-Gemini box convention (per AI Studio docs, same as example4/5): boxes come back
-as [ymin, xmin, ymax, xmax] in normalized 0-1000 coords. If your overlays look
-transposed, that's the first thing to flip.
+  This node serves both; the caller says which camera via the "camera" field.
+  The response echoes back the camera AND its optical frame, so the lift service
+  knows which point cloud to use and the orchestrator knows which frame to TF
+  from. ONE detect call == ONE camera.
 
-Output contract (unchanged):
-  {"detections": [{"object": str,
-                   "bbox":   [x1, y1, x2, y2],   # pixels
-                   "center": [cx, cy],           # pixels
-                   "conf":   float}]}            # always 1.0 with Gemini
+  >>> The matching lift service (grasp_server / 'lift_bbox_to_3d') must ALSO be
+      made camera-aware: lift a 'scene' bbox against the scene cloud, a 'wrist'
+      bbox against the wrist cloud. A scene bbox + wrist cloud silently returns
+      garbage 3D. <<<
+
+RUNTIME REQUIREMENT: needs INTERNET + a Gemini API key (same caveat as the
+single-camera Gemini node). Pass it in:
+    sudo docker run ... -e GEMINI_API_KEY="..." image_team_2
+or set the 'api_key' ROS param.
+
+Gemini box convention (AI Studio docs, same as example4/5): boxes come back as
+[ymin, xmin, ymax, xmax] normalized 0-1000. If overlays look transposed, that's
+the first thing to flip in _parse().
 """
 import os
 import re
 import json
+from functools import partial
 from datetime import datetime
 
 import numpy as np
@@ -68,7 +71,7 @@ from team_2_interfaces.srv import DetectObjects
 
 
 # Matches one [ymin, xmin, ymax, xmax, 'label'] entry anywhere in the text
-# (tolerates code fences / stray prose around it, and missing label quotes).
+# (tolerates code fences / stray prose, and missing label quotes).
 _BOX_RE = re.compile(
     r'\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,'
     r'\s*["\']?\s*([\w\s\-]+?)\s*["\']?\s*\]'
@@ -80,25 +83,29 @@ class PerceptionNode(Node):
         super().__init__('perception_node')
 
         # --- API / model ----------------------------------------------------
-        self.declare_parameter('api_key', '')
-        # example4 used 'gemini-2.5-flash' for detection; example5 used
-        # 'gemini-3.1-flash-lite-preview'. Switch here via param if you like.
-        self.declare_parameter('model', 'gemini-2.5-flash')
+        api_key = os.getenv('GEMINI_API_KEY')
+        if not api_key:
+            api_key = self.get_parameter('api_key').get_parameter_value().string_value
+        
+        self.declare_parameter('api_key', api_key)
+        self.declare_parameter('model', 'gemini-3-flash-preview')
 
-        # --- topics / service ----------------------------------------------
-        self.declare_parameter(
-            'image_topic', '/wrist_camera/wrist_camera/color/image_raw')
+        # --- cameras --------------------------------------------------------
+        # Topic + optical frame for each camera. The optical frame is what the
+        # lift service / orchestrator must TF from for that camera's detections.
+        self.declare_parameter('scene_image_topic', '/camera/camera/color/image_raw')
+        self.declare_parameter('wrist_image_topic', '/wrist_camera/wrist_camera/color/image_raw')
+        self.declare_parameter('scene_optical_frame', 'camera_color_optical_frame')
+        self.declare_parameter('wrist_optical_frame', 'wrist_camera_color_optical_frame')
+        self.declare_parameter('default_camera', 'wrist')
+
+        # --- service / debug ------------------------------------------------
         self.declare_parameter('detect_service', 'detect_objects')
         self.declare_parameter('detections_topic', '/detections')
-
-        # --- post-processing ------------------------------------------------
-        # Drop whole-scene / whole-arm garbage boxes (set >= 1.0 to disable).
-        # Tune to your largest real object's on-screen footprint.
+        # Drop whole-scene / whole-arm garbage boxes (>= 1.0 disables).
         self.declare_parameter('max_area_frac', 0.15)
-
-        # --- debug overlays -------------------------------------------------
         self.declare_parameter('save_annotated', True)
-        self.declare_parameter('annotated_dir', '/models/detections')
+        self.declare_parameter('annotated_dir', '/detections')
 
         api_key = os.getenv('GEMINI_API_KEY') \
             or self.get_parameter('api_key').get_parameter_value().string_value
@@ -110,7 +117,14 @@ class PerceptionNode(Node):
         self.model = self.get_parameter('model').value
         self.client = genai.Client(api_key=api_key)
 
+        self.default_camera = self.get_parameter('default_camera').value
         self.max_area_frac = float(self.get_parameter('max_area_frac').value)
+
+        # Per-camera optical frames, reported back in every response.
+        self.optical_frames = {
+            'scene': self.get_parameter('scene_optical_frame').value,
+            'wrist': self.get_parameter('wrist_optical_frame').value,
+        }
 
         self.save_annotated = bool(self.get_parameter('save_annotated').value)
         self.annotated_dir = self.get_parameter('annotated_dir').value
@@ -118,115 +132,132 @@ class PerceptionNode(Node):
             os.makedirs(self.annotated_dir, exist_ok=True)
             self.get_logger().info(f'Annotated frames -> {self.annotated_dir}')
 
-        self.get_logger().info(f'Gemini detection backend, model={self.model}')
+        self.get_logger().info(
+            f'Gemini two-camera backend, model={self.model}, '
+            f'default_camera={self.default_camera}')
 
         self.bridge = CvBridge()
-        self.latest = None
+        # Latest BGR frame per camera.
+        self.latest = {'scene': None, 'wrist': None}
 
-        # Camera publishers are BEST_EFFORT — the subscriber MUST match or no
-        # frames arrive (silent QoS-incompatibility, same gotcha as example4/5).
+        # Camera publishers are BEST_EFFORT -- subscriber MUST match or no frames
+        # arrive (silent QoS-incompatibility, same gotcha as example4/5).
         img_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
         self.create_subscription(
-            Image, self.get_parameter('image_topic').value,
-            self.on_image, img_qos)
+            Image, self.get_parameter('scene_image_topic').value,
+            partial(self.on_image, cam='scene'), img_qos)
+        self.create_subscription(
+            Image, self.get_parameter('wrist_image_topic').value,
+            partial(self.on_image, cam='wrist'), img_qos)
 
-        # Debug publisher: still emit /detections so you can watch in rqt. The
-        # orchestrator does NOT read this — it gets the same JSON in the response.
+        # Debug publisher: still emit /detections for rqt. Orchestrator does NOT
+        # read this -- it gets the same JSON back in the service response.
         self.pub = self.create_publisher(
             String, self.get_parameter('detections_topic').value, 10)
 
-        # The trigger: a service instead of a topic callback.
         self.srv = self.create_service(
             DetectObjects, self.get_parameter('detect_service').value,
             self.on_detect_request)
 
         self.get_logger().info(
             'perception_node: STANDBY (serving '
-            f"'{self.get_parameter('detect_service').value}')")
+            f"'{self.get_parameter('detect_service').value}', cameras: "
+            'scene + wrist)')
 
-    def on_image(self, msg):
+    def on_image(self, msg, cam):
         try:
-            self.latest = self.bridge.imgmsg_to_cv2(
+            self.latest[cam] = self.bridge.imgmsg_to_cv2(
                 msg, desired_encoding='bgr8')
         except Exception as e:
-            self.get_logger().error(f'cv_bridge error: {e}')
+            self.get_logger().error(f'cv_bridge error ({cam}): {e}')
 
     def on_detect_request(self, request, response):
-        """Service handler. Reads the CURRENT frame (post-scout-move) and runs
-        detection on the requested classes."""
-        if self.latest is None:
-            self.get_logger().warn('No camera frame yet; returning empty.')
-            response.data = json.dumps({'detections': []})
-            return response
-
-        # Accept either a bare JSON array of names or a {"tasks":[...]} object.
+        """Reads the CURRENT frame from the requested camera and detects the
+        requested classes on it."""
         try:
             parsed = json.loads(request.data)
         except json.JSONDecodeError as e:
             self.get_logger().error(f'Bad request JSON: {e}')
-            response.data = json.dumps({'detections': []})
-            return response
+            return self._empty(response, self.default_camera)
 
+        # --- which camera ---------------------------------------------------
+        camera = self.default_camera
         if isinstance(parsed, dict):
-            classes = sorted({t['object'].strip().lower()
-                              for t in parsed.get('tasks', [])
-                              if t.get('object')})
+            camera = str(parsed.get('camera', self.default_camera)).lower()
+        if camera not in self.latest:
+            self.get_logger().error(
+                f"Unknown camera '{camera}'; valid: {list(self.latest)}.")
+            return self._empty(response, self.default_camera)
+
+        # --- which classes --------------------------------------------------
+        if isinstance(parsed, dict):
+            if 'classes' in parsed:
+                src = parsed['classes']
+                classes = sorted({str(c).strip().lower() for c in src if c})
+            else:
+                classes = sorted({t['object'].strip().lower()
+                                  for t in parsed.get('tasks', [])
+                                  if t.get('object')})
         else:
             classes = sorted({str(c).strip().lower() for c in parsed if c})
 
         if not classes:
             self.get_logger().warn('No target classes in request.')
-            response.data = json.dumps({'detections': []})
-            return response
+            return self._empty(response, camera)
 
-        self.get_logger().info(f'Detecting classes: {classes}')
-        frame = self.latest.copy()
+        frame = self.latest[camera].copy()
+
+        self.get_logger().info("--------------------------------")
+        self.get_logger().info(f"[{camera}] detecting classes: {classes}")
+
         try:
             detections = self.detect(frame, classes)
         except Exception as e:
             self.get_logger().error(f'Detection failed: {e}')
-            response.data = json.dumps({'detections': []})
-            return response
+            return self._empty(response, camera)
 
-        payload = json.dumps({'detections': detections})
+        payload = json.dumps({
+            'camera': camera,
+            'frame': self.optical_frames[camera],
+            'detections': detections,
+        })
         response.data = payload
 
-        # Mirror to the debug topic + disk (unchanged behaviour).
         out = String()
         out.data = payload
         self.pub.publish(out)
-        self.get_logger().info(
-            f'Returned {len(detections)} detection(s): {payload}')
 
         if self.save_annotated:
             try:
-                path = self.save_overlay(frame, detections)
+                path = self.save_overlay(frame, detections, camera)
                 self.get_logger().info(f'Saved annotated frame -> {path}')
             except Exception as e:
                 self.get_logger().error(f'Could not save annotated frame: {e}')
 
+        self.get_logger().info("--------------------------------")
+        return response
+
+    def _empty(self, response, camera):
+        response.data = json.dumps({
+            'camera': camera,
+            'frame': self.optical_frames.get(camera, ''),
+            'detections': [],
+        })
         return response
 
     def detect(self, bgr, classes):
-        """One Gemini call detects every instance of every requested class.
-
-        Querying all classes together (rather than per-class) is cheaper and
-        faster, and because we instruct the model to emit one bracketed list per
-        instance, multiple objects of the same type come back as separate
-        detections for free.
-        """
-        # BGR (cv_bridge) -> RGB -> PIL, as the API expects.
-        rgb = bgr[:, :, ::-1]
+        """One Gemini call detects every instance of every requested class on
+        the given frame."""
+        rgb = bgr[:, :, ::-1]                       # BGR (cv_bridge) -> RGB
         pil = PILImage.fromarray(np.ascontiguousarray(rgb))
         h, w = bgr.shape[:2]
 
         prompt = self._build_prompt(classes)
-        resp = self.client.models.generate_content(
-            model=self.model, contents=[pil, prompt])
+        resp = self.client.models.generate_content(model=self.model, contents=[pil, prompt])
         text = resp.text or ''
         self.get_logger().info(f'Gemini raw: {text.strip()}')
 
@@ -238,58 +269,47 @@ class PerceptionNode(Node):
         names = ', '.join(classes)
         return (
             'Detect every instance of the following objects in the image: '
-            f'{names}. There may be zero, one, or several of each type. '
+            f'{names}. There can be one or several of each type. '
             'For EACH detected instance, output one list of the form '
             "[ymin, xmin, ymax, xmax, 'label'] using integer normalized "
             'coordinates in the range 0-1000, where label is copied EXACTLY '
             'from the object list above. Output only the lists, one per line, '
-            'and no other text. If none of the objects are present, output '
-            'nothing.'
+            'and no other text.'
         )
 
     def _parse(self, text, classes, w, h):
-        """Pull every [ymin,xmin,ymax,xmax,label] out of the model text and map
-        each label back onto one of the requested classes."""
         detections = []
         for m in _BOX_RE.finditer(text):
             ymin, xmin, ymax, xmax = (int(m.group(i)) for i in (1, 2, 3, 4))
             label = self._match_label(m.group(5).strip().lower(), classes)
             if label is None:
-                # Gemini named something we didn't ask for — ignore it.
                 continue
-
-            # normalized 0-1000 -> pixels; min/max guards against swapped corners
             x1 = min(xmin, xmax) * w / 1000.0
             x2 = max(xmin, xmax) * w / 1000.0
             y1 = min(ymin, ymax) * h / 1000.0
             y2 = max(ymin, ymax) * h / 1000.0
-
             detections.append({
                 'object': label,
                 'bbox': [x1, y1, x2, y2],
                 'center': [(x1 + x2) / 2.0, (y1 + y2) / 2.0],
-                'conf': 1.0,                      # Gemini gives no score
+                'conf': 1.0,                          # Gemini gives no score
             })
         return detections
 
     @staticmethod
     def _match_label(raw, classes):
-        """Map a returned label to a requested class. Handles 'coke' -> 'coke
-        can', 'meat' -> 'meat can', exact matches, and single-word overlaps."""
         if raw in classes:
             return raw
-        for c in classes:                         # substring either direction
+        for c in classes:
             if c in raw or raw in c:
                 return c
-        raw_toks = set(raw.split())               # any shared word
+        raw_toks = set(raw.split())
         for c in classes:
             if raw_toks & set(c.split()):
                 return c
         return None
 
     def _filter_oversize(self, detections, w, h):
-        """Drop the whole-scene / whole-arm garbage boxes Grounding DINO loved;
-        Gemini is less prone to them but it still happens occasionally."""
         if self.max_area_frac >= 1.0:
             return detections
         img_area = float(w * h)
@@ -304,10 +324,8 @@ class PerceptionNode(Node):
                     f'({(x2-x1)*(y2-y1)/img_area:.0%} of frame)')
         return kept
 
-    def save_overlay(self, bgr, detections):
-        """Draw boxes + labels with PIL (no cv2 dependency) and write a PNG.
-        Returns the saved path."""
-        rgb = bgr[:, :, ::-1]                       # BGR (cv_bridge) -> RGB
+    def save_overlay(self, bgr, detections, camera):
+        rgb = bgr[:, :, ::-1]
         img = PILImage.fromarray(np.ascontiguousarray(rgb))
         draw = ImageDraw.Draw(img)
         try:
@@ -319,22 +337,19 @@ class PerceptionNode(Node):
             x1, y1, x2, y2 = d['bbox']
             cx, cy = d['center']
             tag = f"{d['object']} {d['conf']:.2f}"
-
             draw.rectangle([x1, y1, x2, y2], outline=(0, 255, 0), width=3)
             draw.ellipse([cx - 4, cy - 4, cx + 4, cy + 4], fill=(255, 0, 0))
-
             if font is not None:
                 l, t, r, b = draw.textbbox((0, 0), tag, font=font)
                 tw, th = r - l, b - t
             else:
                 tw, th = 8 * len(tag), 12
             ty = max(0, y1 - th - 4)
-            draw.rectangle([x1, ty, x1 + tw + 6, ty + th + 4],
-                           fill=(0, 255, 0))
+            draw.rectangle([x1, ty, x1 + tw + 6, ty + th + 4], fill=(0, 255, 0))
             draw.text((x1 + 3, ty + 2), tag, fill=(0, 0, 0), font=font)
 
         stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
-        path = os.path.join(self.annotated_dir, f'det_{stamp}.png')
+        path = os.path.join(self.annotated_dir, f'det_{camera}_{stamp}.png')
         img.save(path)
         return path
 

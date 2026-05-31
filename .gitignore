@@ -10,6 +10,7 @@
 frames.pdf
 frames.gv
 *.jpeg
+.env
 
 # ROS specific files and folders #
 ##################################

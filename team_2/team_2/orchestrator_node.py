@@ -79,15 +79,20 @@ def make_pose(x, y, z, roll, pitch, yaw):
     p.orientation.w = cr * cp * cy + sr * sp * sy
     return p
 
+# --- POSITIONS ---------------------------------------
+# x, y, z, roll, pitch, yaw (in radians)
+HOME_POSE  = (0.45, 0.15, 0.55, math.pi, 0.0, 0.0)
+SCOUT_POSE   = (0.95, -0.3, 0.50, math.pi/2, 0.0, math.pi/2)
 
-# --- SEAM 1/2/3: fill with real values ---------------------------------------
-#                x     y     z     roll      pitch  yaw
-HOME_POSE  = (0.0, 0.0, 0.6, math.pi,   0.0,   0.0)   # oblique view, tune
-SCOUT_POSE   = (-0.20, 0.0, 0.55, math.pi,   -1.0,   0.0)
-PLACE_POSES = {
-    'left storage':  (0.40,  0.30, 0.30, math.pi, 0.0, 0.0),
-    'right storage': (0.40, -0.30, 0.30, math.pi, 0.0, 0.0),
-    'shelf':         (0.45,  0.00, 0.50, math.pi, 0.0, 0.0),
+PRE_SHELF_POSES = [
+    (1.15, 0.2, 0.05, math.pi/2, 0.0, 0.0),
+    (1.15, 0.2, 0.30, math.pi/2, 0.0, 0.0),
+    (0.95, 0.2, 0.50, math.pi/2, 0.0, math.pi/2)
+]
+
+STORAGE_POSES = {
+    'left_storage':  (0.00,  0.55, 0.60, math.pi, 0.0, 0.0),
+    'right_storage': (0.00, -0.55, 0.60, math.pi, 0.0, 0.0),
 }
 # -----------------------------------------------------------------------------
 
@@ -99,12 +104,9 @@ class Orchestrator(Node):
         self.declare_parameter('parsed_tasks_topic', '/parsed_tasks')
         self.declare_parameter('detect_service', 'detect_objects')
         self.declare_parameter('lift_service', 'lift_bbox_to_3d')
-        self.declare_parameter('camera_optical_frame',
-                               'wrist_camera_color_optical_frame')
+        self.declare_parameter('camera_optical_frame', 'wrist_camera_color_optical_frame') #TODO can change to wrist_camera_color_optical_frame if using wrist camera for perception
         self.declare_parameter('base_frame', 'base_link')
-        self.declare_parameter('settle_sec', 0.8)   # let the camera stream catch
-        #                                              up to the new arm pose
-        # NOTE: protocol PDF says 5 min, README says 8 min. Confirm with the TA.
+        self.declare_parameter('settle_sec', 0.8)   # let the camera stream catch up to the new arm pose
         self.declare_parameter('time_budget_sec', 300.0)
 
         self.optical_frame = self.get_parameter('camera_optical_frame').value
@@ -122,10 +124,8 @@ class Orchestrator(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # Service clients.
-        self.detect_cli = self.create_client(
-            DetectObjects, self.get_parameter('detect_service').value)
-        self.lift_cli = self.create_client(
-            StringPose, self.get_parameter('lift_service').value)
+        self.detect_cli = self.create_client(DetectObjects, self.get_parameter('detect_service').value)
+        self.lift_cli = self.create_client(StringPose, self.get_parameter('lift_service').value)
 
         # Latched subscription so a parser that published before we were up
         # still delivers (TRANSIENT_LOCAL must match the parser's publisher QoS).
@@ -140,6 +140,28 @@ class Orchestrator(Node):
             self.on_tasks, tasks_qos)
 
         self.get_logger().info('orchestrator_node: created.')
+
+        self.truth_cli = self.create_client(StringPose, '/get_object_pose')
+        self._wm_cache = []
+        self.create_subscription(String, 'world_model', self._dbg_wm, 10)
+        
+        self.shelf_layer_occupied = [0, 0, 0] # there are three layers on the shelf, track how many objects are in each to know where to place the next one
+
+    def _dbg_wm(self, msg):
+        try:
+            self._wm_cache = json.loads(msg.data).get('world', [])
+        except Exception as e:
+            self.get_logger().warn(f"world_model parse failed: {e}")
+
+    def get_object_truth(self, label):
+        """DEBUG ONLY. Ground truth straight from the /world_model topic"""
+        label = label.strip().lower().replace(' ', '_')
+        for obj in self._wm_cache:
+            if obj.get('name', '').lower().startswith(label):
+                x, y, z = obj['pose'][0], obj['pose'][1], obj['pose'][2]
+                return obj['pose']
+        self.get_logger().warn(f"No world-model entry starting with '{label}'.")
+        return None
 
     # ---- standby trigger ----------------------------------------------------
     def on_tasks(self, msg):
@@ -222,25 +244,18 @@ class Orchestrator(Node):
                         best = (det, task)
         return best
 
-    # ---- arm motions (sole owner) -------------------------------------------
-    def goto_scout(self):
-        self.arm.move_pose(make_pose(*SCOUT_POSE))
-        time.sleep(self.settle)
-
     def grasp_and_place(self, obj_pose_optical, destination):
         """Adapted from example5 ObjectGraspClient.request_pick, plus a
         destination-aware place."""
         move_gripper.gripper_open(self)
 
         # Borrow a downward gripper orientation from FK of a known-good config.
-        pose_bl_to_gripper = self.arm.fk_request(
-            [0.0, -np.pi / 2.0, 1.0, -np.pi / 3.0, -np.pi / 2.0, 0.0])
+        pose_bl_to_gripper = self.arm.fk_request([0.0, -np.pi / 2.0, 1.0, -np.pi / 3.0, -np.pi / 2.0, 0.0])
 
         if not self.wait_for_tf():
             self.get_logger().error('TF never became available.')
             return False
-        obj_bl = self.transform_pose(
-            obj_pose_optical, self.optical_frame, self.base_frame)
+        obj_bl = self.transform_pose(obj_pose_optical, self.optical_frame, self.base_frame)
         if obj_bl is None:
             return False
 
@@ -248,76 +263,103 @@ class Orchestrator(Node):
         goal.orientation = pose_bl_to_gripper.orientation
 
         # 1. approach from above
-        goal.position.y -= 0.01
+        # goal.position.x -= 0.02
         goal.position.z += 0.10
         self.arm.move_pose(goal)
+
         # 2. descend onto the object
-        goal.position.z -= 0.11
+        goal.position.z -= 0.13
         self.arm.move_pose(goal)
         # 3. grasp
         move_gripper.gripper_close(self, force=0.5, gripper_close_pos=0.5)
         # 4. lift clear
         goal.position.z += 0.20
         self.arm.move_pose(goal)
+
         # 5. carry to the storage and release
-        place = PLACE_POSES.get(destination.strip().lower())
-        if place is None:
-            self.get_logger().warn(f"No place pose for destination '{destination}'; releasing in place.")
+        if destination == 'shelf':
+            # calculate which layer of the shelf to place on based on how many objects are already there
+            min_count = min(self.shelf_layer_occupied)
+            layer_idx = next(
+                idx for idx in reversed(range(len(self.shelf_layer_occupied)))
+                if self.shelf_layer_occupied[idx] == min_count
+            )
+            pre_pose = PRE_SHELF_POSES[layer_idx]
+            self.arm.move_pose(make_pose(*pre_pose))
+
+            # change y position to align with the shelf layer
+            place = list(pre_pose)
+            place[1] = -0.30
         else:
-            self.arm.move_pose(make_pose(*place))
+            place = STORAGE_POSES.get(destination)
+
+        self.arm.move_pose(make_pose(*place))
+        
         move_gripper.gripper_open(self)
+
+        if destination == 'shelf':
+            self.shelf_layer_occupied[layer_idx] += 1
+            self.arm.move_pose(make_pose(*pre_pose))
+        
         return True
 
-    # ---- main loop ----------------------------------------------------------
-    # def move_home_pose(self):
-    #     self.get_logger().info('Moving to home pose....')
-    #     self.arm.move_pose(make_pose(*HOME_POSE))
+    def move_to_scout(self):
+        self.get_logger().info('Moving to scout pose...')
+        self.arm.move_pose(make_pose(*SCOUT_POSE))
+        self.get_logger().info(f'Settling for {self.settle} seconds...')
+        time.sleep(self.settle)
 
     def run_contest(self):
         raw = self.tasks
         tasks = raw['tasks'] if isinstance(raw, dict) and 'tasks' in raw else raw
         remaining = list(tasks)
-        self.get_logger().info(
-            f'Leaving STANDBY. {len(remaining)} task(s): {remaining}')
 
-        self.arm.move_pose(make_pose(*HOME_POSE))
         t0 = time.time()
 
         while remaining and (time.time() - t0) < self.time_budget:
-            self.goto_scout()
-
+            self.get_logger().info(f'=======Tasks remaining: {len(remaining)}=======')
+            self.get_logger().info(f'Moving to home pose...')
+                        
             names = sorted({t['object'].strip().lower() for t in remaining})
             dets = self.call_perception(names)
             if not dets:
-                self.get_logger().warn(
-                    'No detections from scout view; stopping. '
-                    '(Add an alternate scout pose here to retry.)')
+                self.get_logger().warn('No detections from scout view; stopping. ')
                 break
 
             pair = self.pick_target(dets, remaining)
             if pair is None:
-                self.get_logger().warn(
-                    'No detection matched a remaining task; stopping.')
+                self.get_logger().warn('No detection matched a remaining task; stopping.')
                 break
+            
             det, task = pair
             self.get_logger().info(
                 f"Target: {task['object']} -> {task['destination']} "
                 f"(conf {det['conf']:.2f}, bbox {det['bbox']})")
 
-            pose_opt = self.call_lift(det['bbox'])
-            if pose_opt is None:
-                # No depth in this box (often a bad/edge detection). Skip this
-                # detection and re-scout rather than risk a blind grasp.
-                self.get_logger().warn('Lift-to-3D failed; re-scouting.')
-                continue
+            
+            pose_opt = self.call_lift(det['bbox'])            
+            obj_bl = self.transform_pose(pose_opt, self.optical_frame, self.base_frame)
+            o = obj_bl.position
+            # ------------- DEBUG: print the lifted pose in base_link, and compare to world_model truth if available -------------
+            truth_world = self.get_object_truth(task['object'])     # [x,y,z,r,p,y] in world, or None
+            truth_pose = make_pose(*truth_world)                # 6-list is (x,y,z,roll,pitch,yaw)
+            truth_bl = self.transform_pose(truth_pose, 'world', self.base_frame)
+            t = truth_bl.position
 
-            if self.grasp_and_place(pose_opt, task['destination']):
+            self.get_logger().warn(f"lifted (base_link): x={o.x:.3f} y={o.y:.3f} z={o.z:.3f}")
+            self.get_logger().warn(f"truth  (base_link): x={t.x:.3f} y={t.y:.3f} z={t.z:.3f}")
+            self.get_logger().warn(f"error  (base_link): dx={o.x-t.x:+.3f} dy={o.y-t.y:+.3f} dz={o.z-t.z:+.3f}")
+            # ------------------------------------------------------------------------------------------------------------------
+
+            if self.grasp_and_place(pose_opt, task['destination'].strip().lower()):
                 remaining.remove(task)
 
+
+            self.get_logger().info("Moving to home pose...")
+            self.arm.move_pose(make_pose(*HOME_POSE))
+
         elapsed = time.time() - t0
-        self.get_logger().info(
-            f'Contest loop ended after {elapsed:.1f}s. '
-            f'{len(remaining)} task(s) left.')
+        self.get_logger().info(f'Contest loop ended after {elapsed:.1f}s with{len(remaining)} task(s) left.')
 
 
 def main():
@@ -325,7 +367,7 @@ def main():
     node = Orchestrator()
     node.wait_for_services()
 
-    # node.move_home_pose()
+    node.move_to_scout()
 
     node.get_logger().info('STANDBY: waiting for /parsed_tasks ...')
     while rclpy.ok() and node.tasks is None:
