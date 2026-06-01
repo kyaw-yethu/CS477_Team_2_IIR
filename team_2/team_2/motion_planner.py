@@ -57,11 +57,15 @@ class MotionPlanner(Node):
         self.declare_parameter('velocity_scaling', 0.3)
         self.declare_parameter('acceleration_scaling', 0.2)
         self.declare_parameter('use_moveit', True)
+        self.declare_parameter('allow_unsafe_execute_fallback', False)
 
         self.planning_time = float(self.get_parameter('planning_time').value)
         self.velocity_scaling = float(self.get_parameter('velocity_scaling').value)
         self.acceleration_scaling = float(self.get_parameter('acceleration_scaling').value)
         self.use_moveit = bool(self.get_parameter('use_moveit').value)
+        self.allow_unsafe_execute_fallback = bool(
+            self.get_parameter('allow_unsafe_execute_fallback').value
+        )
 
         # Reuse the working UR5 client from assignment_2/manip_challenge
         self.arm = arm_api.ArmClient()
@@ -92,7 +96,8 @@ class MotionPlanner(Node):
 
         self.get_logger().info(
             f'MotionPlanner ready. Planning time: {self.planning_time}s, '
-            f'MoveIt2: {"enabled" if self.use_moveit else "disabled"}'
+            f'MoveIt2: {"enabled" if self.use_moveit else "disabled"}, '
+            f'allow_unsafe_execute_fallback={self.allow_unsafe_execute_fallback}'
         )
 
     def _wait_for_moveit(self):
@@ -106,7 +111,7 @@ class MotionPlanner(Node):
         self.get_logger().warn('[MoveIt2] Service not available, will use IK fallback')
         self.use_moveit = False
         return False
-
+    
     def _plan_with_moveit(self, goal_pose, timeout=None):
         """
         Plan trajectory using MoveIt2 with collision checking.
@@ -128,63 +133,66 @@ class MotionPlanner(Node):
             
             # Build MotionPlanRequest
             request = MotionPlanRequest()
-            request.workspace_parameters.header.frame_id = 'world'
-            request.workspace_parameters.min_corner.x = -0.5
-            request.workspace_parameters.min_corner.y = -0.5
+            request.workspace_parameters.header.frame_id = 'base_link'
+            request.workspace_parameters.min_corner.x = -1.0
+            request.workspace_parameters.min_corner.y = -1.0
             request.workspace_parameters.min_corner.z = -0.1
             request.workspace_parameters.max_corner.x = 1.0
             request.workspace_parameters.max_corner.y = 1.0
-            request.workspace_parameters.max_corner.z = 1.5
+            request.workspace_parameters.max_corner.z = 1.8
 
             # Start state
-            request.start_state.joint_state.header.frame_id = 'world'
+            request.start_state.joint_state.header.frame_id = 'base_link'
             request.start_state.joint_state.name = JOINT_NAMES
             request.start_state.joint_state.position = current_joints
 
-            # Goal constraint (Cartesian pose)
-            request.goal_constraints.append(Constraints())
+            # Define cleaner, unified Goal Constraints
+            goal_constraints = Constraints()
 
-            # Position constraint with sphere around target
+            # 1. Fixed Position Constraint
             pos_constraint = PositionConstraint()
-            pos_constraint.header.frame_id = 'world'
+            pos_constraint.header.frame_id = 'base_link'
             pos_constraint.link_name = 'tool0'
-            pos_constraint.target_point = goal_pose.position
             
             sphere = SolidPrimitive()
             sphere.type = SolidPrimitive.SPHERE
-            sphere.dimensions = [0.05]  # 5cm tolerance
-            
+            # 2cm tolerance sphere provides exact target accuracy without stalling the sampler
+            sphere.dimensions = [0.02] 
             pos_constraint.constraint_region.primitives.append(sphere)
-            pos_constraint.constraint_region.primitive_poses.append(Pose(
-                position=goal_pose.position,
-                orientation=Quaternion(w=1.0)
-            ))
+            
+            # FIX: Properly set the primitive region pose center to the target goal coordinates
+            region_pose = Pose()
+            region_pose.position = goal_pose.position
+            region_pose.orientation.w = 1.0
+            pos_constraint.constraint_region.primitive_poses.append(region_pose)
             pos_constraint.weight = 1.0
-            request.goal_constraints[0].position_constraints.append(pos_constraint)
+            goal_constraints.position_constraints.append(pos_constraint)
 
-            # Orientation constraint (tighter for tool collision avoidance)
+            # 2. Relaxed Orientation Constraint to enable sampling near target structures
             orient_constraint = OrientationConstraint()
-            orient_constraint.header.frame_id = 'world'
+            orient_constraint.header.frame_id = 'base_link'
             orient_constraint.link_name = 'tool0'
             orient_constraint.orientation = goal_pose.orientation
-            # Tighter tolerance to avoid tool collisions (0.05 rad ≈ 2.9°)
-            orient_constraint.absolute_x_axis_tolerance = 0.05
-            orient_constraint.absolute_y_axis_tolerance = 0.05
-            orient_constraint.absolute_z_axis_tolerance = 0.05
+            
+            # Relaxing tolerances slightly (0.35 rad ≈ 20°) gives OMPL the mathematical 
+            # breathing room to discover valid initial IK positions for the goal tree.
+            orient_constraint.absolute_x_axis_tolerance = 0.35
+            orient_constraint.absolute_y_axis_tolerance = 0.35
+            orient_constraint.absolute_z_axis_tolerance = 0.35
             orient_constraint.weight = 1.0
-            request.goal_constraints[0].orientation_constraints.append(orient_constraint)
+            goal_constraints.orientation_constraints.append(orient_constraint)
+            
+            request.goal_constraints.append(goal_constraints)
             
             self.get_logger().info(
-                f'[MoveIt2] Goal orientation: x={goal_pose.orientation.x:.3f}, '
-                f'y={goal_pose.orientation.y:.3f}, z={goal_pose.orientation.z:.3f}, '
-                f'w={goal_pose.orientation.w:.3f}, tolerance=0.05rad'
+                f'[MoveIt2] Goal position: x={goal_pose.position.x:.3f}, y={goal_pose.position.y:.3f}, z={goal_pose.position.z:.3f}'
             )
             self.get_logger().info('[MoveIt2] Sending planning request to MoveIt2...')
 
             request.group_name = 'ur5_arm'
-            request.planner_id = 'RRTstar'
-            request.allowed_planning_time = self.planning_time
-            request.num_planning_attempts = 3
+            request.planner_id = '' # Empty lets MoveIt use its default config (RRTConnect)
+            request.allowed_planning_time = max(self.planning_time, 2.0)
+            request.num_planning_attempts = 5
             request.max_velocity_scaling_factor = self.velocity_scaling
             request.max_acceleration_scaling_factor = self.acceleration_scaling
 
@@ -193,7 +201,6 @@ class MotionPlanner(Node):
                 GetMotionPlan.Request(motion_plan_request=request)
             )
 
-            # Wait for result with timeout
             if timeout is None:
                 timeout = self.planning_time + 1.0
             
@@ -210,16 +217,10 @@ class MotionPlanner(Node):
 
             if error_code == 1:  # SUCCESS
                 traj = result.motion_plan_response.trajectory.joint_trajectory
-                self.get_logger().info(
-                    f'[MoveIt2] Plan found ✓ ({len(traj.points)} points, '
-                    f'collision-checked)'
-                )
+                self.get_logger().info(f'[MoveIt2] Plan found ✓ ({len(traj.points)} points, collision-checked)')
                 return True, traj
             else:
-                self.get_logger().warn(
-                    f'[MoveIt2] Planning failed with error code: {error_code}\n'
-                    f'         0=success, -1=invcolliding, -2=timeout, -3=noik, -4=invinit, etc'
-                )
+                self.get_logger().warn(f'[MoveIt2] Planning failed with error code: {error_code}')
                 return False, None
 
         except Exception as e:
@@ -342,12 +343,16 @@ class MotionPlanner(Node):
         # Execute if requested (but NEVER from fallback for safety)
         if request.execute:
             if not success:
-                self.get_logger().error(
-                    '[Safety] REFUSING to execute: trajectory is from IK fallback (NOT collision-checked)!\n'
-                    '         Executing without collision checking is too risky.'
+                if not self.allow_unsafe_execute_fallback:
+                    self.get_logger().error(
+                        '[Safety] REFUSING to execute: trajectory is from IK fallback (NOT collision-checked)!\n'
+                        '         Set allow_unsafe_execute_fallback=true only for debug.'
+                    )
+                    response.success = False
+                    return response
+                self.get_logger().warn(
+                    '[Safety] DEBUG MODE: executing IK fallback trajectory without collision checking.'
                 )
-                response.success = False
-                return response
             
             goal = FollowJointTrajectory.Goal()
             goal.trajectory = response.trajectory

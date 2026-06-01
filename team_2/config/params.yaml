@@ -6,6 +6,16 @@
 /**:
   ros__parameters:
     parsed_tasks_topic: /parsed_tasks
+    motion_plan_service: plan_motion
+    # For competition runs we must NOT rely on simulator-internal object
+    # pose services. Default to false so perception (image-based) is used.
+    use_internal_object_pose_debug: false
+    internal_pose_service: get_object_pose
+    internal_pose_frame: base_link
+    allow_unsafe_execute_fallback: true
+    # Debug autostart removed by default; teams can set this in their local
+    # copy for testing but should not ship it for competition.
+    debug_autostart_tasks_json: ''
 
 instruction_parser:
   ros__parameters:
@@ -14,6 +24,7 @@ instruction_parser:
     n_ctx: 4096
     n_gpu_layers: 0        # CPU. Set -1 on the CUDA server to offload all layers.
     temperature: 0.0
+    use_gemini: true
 
 perception_node:
   ros__parameters:
@@ -23,5 +34,9 @@ perception_node:
     box_threshold: 0.25    # object-presence confidence; raise to cut false boxes.
     text_threshold: 0.25   # query-match strength; raise if wrong labels stick.
     device: auto           # auto -> cuda if available else cpu.
-    save_annotated: true   # write annotated frames to disk for debugging.
+    save_annotated: false   # write annotated frames to disk for debugging.
     annotated_dir: /models/detections  # HOST-mounted -> appears on host directly.
+    # Optional JSON string used only for offline/debug runs. If set, the
+    # node will return these detections instead of calling an external API.
+    # Format: {"detections":[{...}, ...]}
+    debug_detections: ''

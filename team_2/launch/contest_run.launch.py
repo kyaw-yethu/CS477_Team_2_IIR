@@ -20,6 +20,8 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
+from launch.actions import IncludeLaunchDescription
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 
 
@@ -27,10 +29,21 @@ def generate_launch_description():
     pkg_share = get_package_share_directory('team_2')
     params = os.path.join(pkg_share, 'config', 'params.yaml')
 
+    moveit_pkg = get_package_share_directory('ur5_ros2_moveit2')
+    moveit_launch = os.path.join(moveit_pkg, 'launch', 'ur5_moveit_external.launch.py')
+
     common = dict(package='team_2', output='screen',
                   emulate_tty=True, parameters=[params])
 
     return LaunchDescription([
+        # Start MoveIt2 (move_group) without spawning Gazebo.
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(moveit_launch),
+            launch_arguments={
+                'use_sim_time': 'true',
+                'rviz': 'false',
+            }.items(),
+        ),
         Node(executable='instruction_parser',
              name='instruction_parser', **common),
         Node(executable='perception_node',

@@ -56,7 +56,7 @@ from tf2_ros import (Buffer, TransformListener, LookupException,
                      ConnectivityException, ExtrapolationException)
 import tf2_geometry_msgs  # noqa: F401  (registers Pose transforms with tf2)
 
-from team_2_interfaces.srv import DetectObjects
+from team_2_interfaces.srv import DetectObjects, PlanMotion
 from riro_srvs.srv import StringPose          # reused for the bbox -> 3D lift
 
 # --- SEAM 4: match these to your working grasp code --------------------------
@@ -85,8 +85,8 @@ def make_pose(x, y, z, roll, pitch, yaw):
 HOME_POSE  = (0.0, 0.0, 0.6, math.pi,   0.0,   0.0)   # oblique view, tune
 SCOUT_POSE   = (-0.20, 0.0, 0.55, math.pi,   -1.0,   0.0)
 PLACE_POSES = {
-    'left storage':  (0.40,  0.30, 0.30, math.pi, 0.0, 0.0),
-    'right storage': (0.40, -0.30, 0.30, math.pi, 0.0, 0.0),
+    'left_storage':  (0.40,  0.30, 0.30, math.pi, 0.0, 0.0),
+    'right_storage': (0.40, -0.30, 0.30, math.pi, 0.0, 0.0),
     'shelf':         (0.45,  0.00, 0.50, math.pi, 0.0, 0.0),
 }
 # -----------------------------------------------------------------------------
@@ -106,11 +106,23 @@ class Orchestrator(Node):
         #                                              up to the new arm pose
         # NOTE: protocol PDF says 5 min, README says 8 min. Confirm with the TA.
         self.declare_parameter('time_budget_sec', 300.0)
+        self.declare_parameter('motion_plan_service', 'plan_motion')
+        self.declare_parameter('use_internal_object_pose_debug', False)
+        self.declare_parameter('internal_pose_service', 'get_object_pose')
+        self.declare_parameter('internal_pose_frame', 'base_link')
+        self.declare_parameter('debug_autostart_tasks_json', '')
 
         self.optical_frame = self.get_parameter('camera_optical_frame').value
         self.base_frame = self.get_parameter('base_frame').value
         self.settle = float(self.get_parameter('settle_sec').value)
         self.time_budget = float(self.get_parameter('time_budget_sec').value)
+        self.use_internal_pose_debug = bool(
+            self.get_parameter('use_internal_object_pose_debug').value
+        )
+        self.internal_pose_frame = self.get_parameter('internal_pose_frame').value
+        self.debug_autostart_tasks_json = self.get_parameter(
+            'debug_autostart_tasks_json'
+        ).value
 
         self.tasks = None  # set when /parsed_tasks arrives -> leaves standby
 
@@ -126,6 +138,10 @@ class Orchestrator(Node):
             DetectObjects, self.get_parameter('detect_service').value)
         self.lift_cli = self.create_client(
             StringPose, self.get_parameter('lift_service').value)
+        self.plan_cli = self.create_client(
+            PlanMotion, self.get_parameter('motion_plan_service').value)
+        self.internal_pose_cli = self.create_client(
+            StringPose, self.get_parameter('internal_pose_service').value)
 
         # Latched subscription so a parser that published before we were up
         # still delivers (TRANSIENT_LOCAL must match the parser's publisher QoS).
@@ -139,7 +155,22 @@ class Orchestrator(Node):
             String, self.get_parameter('parsed_tasks_topic').value,
             self.on_tasks, tasks_qos)
 
-        self.get_logger().info('orchestrator_node: created.')
+        if self.use_internal_pose_debug and self.debug_autostart_tasks_json:
+            try:
+                parsed = json.loads(self.debug_autostart_tasks_json)
+                self.tasks = parsed
+                self.get_logger().warn(
+                    '[DEBUG] Auto-start tasks loaded from debug_autostart_tasks_json.'
+                )
+            except json.JSONDecodeError as e:
+                self.get_logger().error(
+                    f'[DEBUG] Invalid debug_autostart_tasks_json: {e}'
+                )
+
+        self.get_logger().info(
+            f'orchestrator_node: created. '
+            f'debug_internal_pose={self.use_internal_pose_debug}'
+        )
 
     # ---- standby trigger ----------------------------------------------------
     def on_tasks(self, msg):
@@ -150,22 +181,63 @@ class Orchestrator(Node):
 
     # ---- service helpers ----------------------------------------------------
     def wait_for_services(self):
-        for cli, name in ((self.detect_cli, 'detect_objects'),
-                          (self.lift_cli, 'lift_bbox_to_3d')):
+        required = [
+            (self.plan_cli, self.get_parameter('motion_plan_service').value),
+        ]
+
+        if self.use_internal_pose_debug:
+            required.append(
+                (self.internal_pose_cli, self.get_parameter('internal_pose_service').value)
+            )
+        else:
+            required.extend([
+                (self.detect_cli, 'detect_objects'),
+                (self.lift_cli, 'lift_bbox_to_3d'),
+            ])
+
+        for cli, name in required:
             while rclpy.ok() and not cli.wait_for_service(timeout_sec=1.0):
                 self.get_logger().info(f"Waiting for '{name}' service...")
+
+    def call_plan_motion(self, goal_pose, execute=True):
+        req = PlanMotion.Request()
+        req.goal_pose = goal_pose
+        req.execute = bool(execute)
+        fut = self.plan_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, fut)
+        res = fut.result()
+        if res is None:
+            self.get_logger().error('plan_motion call failed (no response).')
+            return False
+        return bool(res.success)
+
+    def call_internal_object_pose(self, object_name):
+        req = StringPose.Request()
+        req.data = object_name
+        fut = self.internal_pose_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, fut)
+        res = fut.result()
+        if res is None:
+            self.get_logger().error('get_object_pose call failed (no response).')
+            return None
+        return res.pose
 
     def call_perception(self, names):
         req = DetectObjects.Request()
         req.data = json.dumps(names)
+        self.get_logger().info(f'Calling perception for objects: {names}')
         fut = self.detect_cli.call_async(req)
         rclpy.spin_until_future_complete(self, fut)
         res = fut.result()
         if res is None:
+            self.get_logger().error('detect_objects call failed (no response).')
             return []
         try:
-            return json.loads(res.data).get('detections', [])
+            detections = json.loads(res.data).get('detections', [])
+            self.get_logger().info(f'Perception returned {len(detections)} detections.')
+            return detections
         except json.JSONDecodeError:
+            self.get_logger().error('detect_objects returned invalid JSON.')
             return []
 
     def call_lift(self, bbox):
@@ -173,15 +245,22 @@ class Orchestrator(Node):
         or None if the grasp server found no valid depth in the box."""
         req = StringPose.Request()
         req.data = json.dumps(bbox)
+        self.get_logger().info(f'Calling lift service for bbox: {bbox}')
         fut = self.lift_cli.call_async(req)
         rclpy.spin_until_future_complete(self, fut)
         res = fut.result()
         if res is None:
+            self.get_logger().error('lift_bbox_to_3d call failed (no response).')
             return None
         p = res.pose
         # The grasp server returns an empty Pose (all zeros) on failure.
         if p.position.x == 0.0 and p.position.y == 0.0 and p.position.z == 0.0:
+            self.get_logger().warn('lift_bbox_to_3d returned empty pose.')
             return None
+        self.get_logger().info(
+            f'Lift returned optical-frame pose: x={p.position.x:.3f}, '
+            f'y={p.position.y:.3f}, z={p.position.z:.3f}'
+        )
         return p
 
     # ---- TF -----------------------------------------------------------------
@@ -224,8 +303,62 @@ class Orchestrator(Node):
 
     # ---- arm motions (sole owner) -------------------------------------------
     def goto_scout(self):
-        self.arm.move_pose(make_pose(*SCOUT_POSE))
+        if not self.call_plan_motion(make_pose(*SCOUT_POSE), execute=True):
+            self.get_logger().warn('Scout motion planning failed.')
         time.sleep(self.settle)
+
+    def _plan_pose_or_fail(self, pose, label):
+        if not self.call_plan_motion(pose, execute=True):
+            self.get_logger().error(f'Planning failed for step: {label}')
+            return False
+        return True
+
+    def normalize_destination(self, destination):
+        d = str(destination).strip().lower()
+        return d.replace(' ', '_')
+
+    def grasp_and_place_base(self, obj_pose_bl, destination):
+        """Pick/place from object pose in base frame using motion_planner."""
+        move_gripper.gripper_open(self)
+
+        pose_bl_to_gripper = self.arm.fk_request(
+            [0.0, -np.pi / 2.0, 1.0, -np.pi / 3.0, -np.pi / 2.0, 0.0])
+
+        goal = copy.copy(obj_pose_bl)
+        goal.orientation = pose_bl_to_gripper.orientation
+
+        # 1. approach from above
+        goal.position.y -= 0.01
+        goal.position.z += 0.10
+        if not self._plan_pose_or_fail(goal, 'approach'):
+            return False
+
+        # 2. descend onto the object
+        goal.position.z -= 0.11
+        if not self._plan_pose_or_fail(goal, 'descend'):
+            return False
+
+        # 3. grasp
+        move_gripper.gripper_close(self, force=0.5, gripper_close_pos=0.5)
+
+        # 4. lift clear
+        goal.position.z += 0.20
+        if not self._plan_pose_or_fail(goal, 'lift'):
+            return False
+
+        # 5. carry to storage and release
+        norm_dest = self.normalize_destination(destination)
+        place = PLACE_POSES.get(norm_dest)
+        if place is None:
+            self.get_logger().warn(
+                f"No place pose for destination '{destination}' (normalized '{norm_dest}'); releasing in place."
+            )
+        else:
+            if not self._plan_pose_or_fail(make_pose(*place), 'place'):
+                return False
+
+        move_gripper.gripper_open(self)
+        return True
 
     def grasp_and_place(self, obj_pose_optical, destination):
         """Adapted from example5 ObjectGraspClient.request_pick, plus a
@@ -244,29 +377,7 @@ class Orchestrator(Node):
         if obj_bl is None:
             return False
 
-        goal = copy.copy(obj_bl)
-        goal.orientation = pose_bl_to_gripper.orientation
-
-        # 1. approach from above
-        goal.position.y -= 0.01
-        goal.position.z += 0.10
-        self.arm.move_pose(goal)
-        # 2. descend onto the object
-        goal.position.z -= 0.11
-        self.arm.move_pose(goal)
-        # 3. grasp
-        move_gripper.gripper_close(self, force=0.5, gripper_close_pos=0.5)
-        # 4. lift clear
-        goal.position.z += 0.20
-        self.arm.move_pose(goal)
-        # 5. carry to the storage and release
-        place = PLACE_POSES.get(destination.strip().lower())
-        if place is None:
-            self.get_logger().warn(f"No place pose for destination '{destination}'; releasing in place.")
-        else:
-            self.arm.move_pose(make_pose(*place))
-        move_gripper.gripper_open(self)
-        return True
+        return self.grasp_and_place_base(obj_bl, destination)
 
     # ---- main loop ----------------------------------------------------------
     # def move_home_pose(self):
@@ -280,10 +391,36 @@ class Orchestrator(Node):
         self.get_logger().info(
             f'Leaving STANDBY. {len(remaining)} task(s): {remaining}')
 
-        self.arm.move_pose(make_pose(*HOME_POSE))
+        self.call_plan_motion(make_pose(*HOME_POSE), execute=True)
         t0 = time.time()
 
         while remaining and (time.time() - t0) < self.time_budget:
+            if self.use_internal_pose_debug:
+                task = remaining[0]
+                self.get_logger().info(
+                    f"[DEBUG] Internal pose mode: target {task['object']} -> {task['destination']}"
+                )
+
+                pose_internal = self.call_internal_object_pose(task['object'])
+                if pose_internal is None:
+                    self.get_logger().warn('[DEBUG] get_object_pose failed; stopping.')
+                    break
+
+                obj_bl = pose_internal
+                if self.internal_pose_frame != self.base_frame:
+                    obj_bl = self.transform_pose(
+                        pose_internal,
+                        self.internal_pose_frame,
+                        self.base_frame,
+                    )
+                    if obj_bl is None:
+                        self.get_logger().warn('[DEBUG] internal pose TF failed; re-scouting.')
+                        continue
+
+                if self.grasp_and_place_base(obj_bl, task['destination']):
+                    remaining.remove(task)
+                continue
+
             self.goto_scout()
 
             names = sorted({t['object'].strip().lower() for t in remaining})

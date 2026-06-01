@@ -81,6 +81,9 @@ class PerceptionNode(Node):
 
         # --- API / model ----------------------------------------------------
         self.declare_parameter('api_key', '')
+        # Optional offline/debug detections: JSON string to return instead of
+        # calling an external API. See config/params.yaml debug_detections.
+        self.declare_parameter('debug_detections', '')
         # example4 used 'gemini-2.5-flash' for detection; example5 used
         # 'gemini-3.1-flash-lite-preview'. Switch here via param if you like.
         self.declare_parameter('model', 'gemini-2.5-flash')
@@ -102,13 +105,15 @@ class PerceptionNode(Node):
 
         api_key = os.getenv('GEMINI_API_KEY') \
             or self.get_parameter('api_key').get_parameter_value().string_value
-        if not api_key:
-            raise ValueError(
-                'Gemini API key is not set. Set the GEMINI_API_KEY environment '
-                "variable or provide the 'api_key' ROS parameter.")
-
         self.model = self.get_parameter('model').value
-        self.client = genai.Client(api_key=api_key)
+        self.debug_detections = self.get_parameter('debug_detections').value
+
+        if not api_key:
+            self.get_logger().warn(
+                'No Gemini API key set — using debug/local detection fallback.')
+            self.client = None
+        else:
+            self.client = genai.Client(api_key=api_key)
 
         self.max_area_frac = float(self.get_parameter('max_area_frac').value)
 
@@ -186,7 +191,21 @@ class PerceptionNode(Node):
         self.get_logger().info(f'Detecting classes: {classes}')
         frame = self.latest.copy()
         try:
-            detections = self.detect(frame, classes)
+            if self.client is None:
+                # Offline/debug mode: return provided debug detections if any.
+                if self.debug_detections:
+                    try:
+                        dbg = json.loads(self.debug_detections)
+                        detections = dbg.get('detections', [])
+                        self.get_logger().info('Returning debug detections (offline mode).')
+                    except Exception as e:
+                        self.get_logger().error(f'Bad debug_detections JSON: {e}')
+                        detections = []
+                else:
+                    self.get_logger().warn('No detection backend available; returning empty list.')
+                    detections = []
+            else:
+                detections = self.detect(frame, classes)
         except Exception as e:
             self.get_logger().error(f'Detection failed: {e}')
             response.data = json.dumps({'detections': []})
