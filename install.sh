@@ -2,7 +2,7 @@
 
 # Install dependencies
 sudo apt-get -y update
-sudo xargs -a ./src/cs477_IIR/apt-packages.txt apt install -y
+sudo xargs -a ./src/CS477_Team_2_IRR/apt-packages.txt apt install -y
 
 # Install realsense2 camera SDK
 sudo mkdir -p /etc/apt/keyrings
@@ -13,12 +13,12 @@ sudo apt-get -y install librealsense2-dkms librealsense2-utils librealsense2-dev
 
 # Install default requirements
 pip install --upgrade pip
-pip install -r ./src/cs477_IIR/requirements.txt
+pip install -r ./src/CS477_Team_2_IRR/requirements.txt
 pip install "setuptools<66.0"
 
 # Install moveit
 sudo cp ./src/cs477_IIR/utils/include/move_group_interface_improved.h /opt/ros/humble/include/moveit/move_group_interface/
-vcs import --input src/cs477_IIR/docs/common_sim.repos --workers 1
+vcs import --input src/CS477_Team_2_IRR/docs/common_sim.repos --workers 1
 
 #source /opt/ros/humble/setup.bash
 #rosdep install -i --from-path src --rosdistro humble --skip-keys gazebo_grasp_plugin gazebo_version_helpers roboticsgroup_upatras_gazebo_plugins -y -r
