@@ -57,7 +57,6 @@ def make_pose(x, y, z, roll, pitch, yaw):
     p.orientation.z = cr * cp * sy - sr * sp * cy
     p.orientation.w = cr * cp * cy + sr * sp * sy
     return p
-
 # --- POSITIONS ----------------------------------------------------------------
 # x, y, z, roll, pitch, yaw (radians)
 HOME_POSES = [
@@ -82,8 +81,8 @@ HOME_POSES = [
 # ]
 
 # STORAGE_POSES = {
-#     'left_storage':  (-0.05,  0.60, 0.55, math.pi, 0.0, 0.0),
-#     'right_storage': (-0.05, -0.60, 0.55, math.pi, 0.0, 0.0)
+#     'left_storage':  (-0.05,  0.60, 0.25, math.pi, 0.0, 0.0),
+#     'right_storage': (-0.05, -0.60, 0.25, math.pi, 0.0, 0.0)
 # }
 
 HOME_POSES_JOINTS = [
@@ -94,9 +93,10 @@ HOME_POSES_JOINTS = [
 SCOUT_POSE_JOINTS = [0.017202321595274267, -2.8693023874037227, 1.4228273057359349, -0.9013666354949029, -1.5966035125312512, 0.012271264979222866]
 
 STORAGE_POSES_JOINTS = {
-                    'left_storage': [1.3353573876166518, -1.348273758932529, 0.6411880748192984, -0.874215158899556, -1.5737074037209007, 2.8773348290953638],
-                    'right_storage': [-1.7935734073518597, -1.2752218287662815, 0.5669301759815633, -0.8697850266449945, -1.576582165253679, -0.22061197194364868]
+                    'left_storage': [1.3262682423335923, -1.5261878782927405, 1.5006351440038201, -1.5529224614769819, -1.5643691270548534, 2.868371580877126],
+                    'right_storage': [-1.7741962334802774, -1.4659544651890226, 1.4349766582912324, -1.5319499488171424, -1.576430258078094, -0.20136340291521987]
                     }
+# 
 
 PRE_SHELF_POSES_JOINTS = [
                     [0.17285882419207604, 0.009414032585641493, 0.04142618024092783, -1.2309130438531848, -3.1167689924260484, 1.9431021777750577],
@@ -110,10 +110,6 @@ POST_SHELF_POSES_JOINTS = [
     [-0.5558515282526402, -0.45263417722776306, 0.17613617529742698, -2.8599554581953335, -1.0168549357011385, -0.0028841526061399313]
 ]
 
-# Oriented-grasp convention: once we know the object's long-axis yaw in
-# base_link, the jaws must close ACROSS it (perpendicular) -> +90°. If grasps
-# come out rotated 90° (jaws along the long axis instead), flip this to 0.0.
-# One-time calibration; depends on which way the borrowed FK gripper opens.
 GRIPPER_YAW_OFFSET = math.pi / 2.0
 # -----------------------------------------------------------------------------
 
@@ -127,12 +123,10 @@ class Orchestrator(Node):
         self.declare_parameter('lift_service', 'lift_bbox_to_3d')
         self.declare_parameter('camera_optical_frame', 'wrist_camera_color_optical_frame')
         self.declare_parameter('base_frame', 'base_link')
-        self.declare_parameter('settle_sec', 0.8)   # let the camera stream catch up to the new arm pose
         self.declare_parameter('time_budget_sec', 300.0)
 
         self.optical_frame = self.get_parameter('camera_optical_frame').value
         self.base_frame = self.get_parameter('base_frame').value
-        self.settle = float(self.get_parameter('settle_sec').value)
         self.time_budget = float(self.get_parameter('time_budget_sec').value)
 
         self.tasks = None  # set when /parsed_tasks arrives -> leaves standby
@@ -156,33 +150,12 @@ class Orchestrator(Node):
             depth=1,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
-        self.create_subscription(
-            String, self.get_parameter('parsed_tasks_topic').value,
-            self.on_tasks, tasks_qos)
+        self.create_subscription(String, self.get_parameter('parsed_tasks_topic').value, self.on_tasks, tasks_qos)
 
         self.get_logger().info('orchestrator_node: created.')
 
-        self.truth_cli = self.create_client(StringPose, '/get_object_pose')
-        self._wm_cache = []
-        self.create_subscription(String, 'world_model', self._dbg_wm, 10)
-
         self.shelf_layer_occupied = [0, 0, 0] # there are three layers on the shelf, track how many objects are in each to know where to place the next one
 
-    def _dbg_wm(self, msg):
-        try:
-            self._wm_cache = json.loads(msg.data).get('world', [])
-        except Exception as e:
-            self.get_logger().warn(f"world_model parse failed: {e}")
-
-    def get_object_truth(self, label):
-        """DEBUG ONLY. Ground truth straight from the /world_model topic"""
-        label = label.strip().lower().replace(' ', '_')
-        for obj in self._wm_cache:
-            if obj.get('name', '').lower().startswith(label):
-                x, y, z = obj['pose'][0], obj['pose'][1], obj['pose'][2]
-                return obj['pose']
-        self.get_logger().warn(f"No world-model entry starting with '{label}'.")
-        return None
 
     # ---- standby trigger ----------------------------------------------------
     def on_tasks(self, msg):
@@ -252,11 +225,7 @@ class Orchestrator(Node):
             self.get_logger().warn('Lift-to-3D failed (no valid depth in bbox).')
             return None
 
-        obj_bl = self.transform_pose(pose_opt, self.optical_frame, self.base_frame)
-        if obj_bl is None:
-            return None
-
-        return det, task, pose_opt, obj_bl
+        return pose_opt
 
     # ---- TF -----------------------------------------------------------------
     def transform_pose(self, pose, source_frame, target_frame):
@@ -308,11 +277,6 @@ class Orchestrator(Node):
         """Decode the object's long-axis angle (grasp_server packs it into
         pose_opt.orientation as a rotation about optical +Z), snap to one of four
         image-space buckets, and return (bucket_name, wrist3_delta_rad).
-
-        The delta goes STRAIGHT into rotate_gripper(): the wrist camera rotates WITH
-        wrist_3, so an angle measured in the image is already a wrist_3 increment --
-        no base_link TF needed. GRIPPER_YAW_OFFSET turns the jaws to close ACROSS
-        (perpendicular to) the long axis.
         """
         q = pose_opt.orientation
         angle = 2.0 * math.atan2(q.z, q.w)        # long-axis angle in optical XY
@@ -332,7 +296,10 @@ class Orchestrator(Node):
         # takes the short way round (jaws are symmetric under 180 deg -> no joint-limit swings).
         delta = a_snap + GRIPPER_YAW_OFFSET
         delta = (delta + math.pi / 2.0) % math.pi - math.pi / 2.0
-        return name, delta
+
+        self.get_logger().info(f'OBB: {name} -> wrist_3 += {math.degrees(delta):+.0f} deg')
+
+        return delta
 
     # ---- arm moves ----------------------------------------------------------        
     def move_to_scout(self):
@@ -362,7 +329,10 @@ class Orchestrator(Node):
             self.get_logger().error('TF never became available.')
             return False
 
-        obj_bl = self.transform_pose(obj_pose_optical, self.optical_frame, self.base_frame)
+        neutral_opt = Pose()
+        neutral_opt.position = obj_pose_optical.position
+        neutral_opt.orientation.w = 1.0          # identity: no long-axis spin
+        obj_bl = self.transform_pose(neutral_opt, self.optical_frame, self.base_frame)
 
         # ---1. approach---
         goal = copy.copy(obj_bl)
@@ -370,9 +340,7 @@ class Orchestrator(Node):
         self.move_pose_by_joints(goal)
             
         # ---2. spin the jaws of the gripper in place---
-        cat_name, grasp_yaw = self._oriented_grasp_yaw(obj_pose_optical)
-        self.get_logger().info(f'OBB: {cat_name} -> wrist_3 += {math.degrees(grasp_yaw):+.0f} deg')
-        self.rotate_gripper(grasp_yaw)
+        self.rotate_gripper(self._oriented_grasp_yaw(obj_pose_optical))
 
         # ---3. descend, keeping the rotated orientation---
         cur = list(get_joint.get_joint_angles(self))
@@ -381,14 +349,13 @@ class Orchestrator(Node):
         self.arm.move_pose(goal)
 
         # ---4. grasp---
-        move_gripper.gripper_close(self, force=0.5, gripper_close_pos=0.5)
+        move_gripper.gripper_close(self, force=0.5, gripper_close_pos=0.55)
 
         # ---5. lift clear---
         goal.position.z += 0.40
         self.arm.move_pose(goal)
 
         # ---6. carry to the storage and release---
-        # if shelf, moving to the pre-place pose is necessary
         if destination == 'shelf':
             # calculate which layer of the shelf to place on based on how many objects are already there
             min_count = min(self.shelf_layer_occupied)
@@ -396,8 +363,9 @@ class Orchestrator(Node):
                 idx for idx in reversed(range(len(self.shelf_layer_occupied)))
                 if self.shelf_layer_occupied[idx] == min_count
             )
-            self.arm.move_joint(PRE_SHELF_POSES_JOINTS[layer_idx])
-            self.arm.move_joint(POST_SHELF_POSES_JOINTS[layer_idx])
+            self.arm.move_joint(HOME_POSES_JOINTS[1]) # move to a middle home pose before going to the shelf to avoid collisions with the shelf when moving from the lift pose
+            self.arm.move_joint(PRE_SHELF_POSES_JOINTS[layer_idx]) # move to the pre-place pose for the correct layer
+            self.arm.move_joint(POST_SHELF_POSES_JOINTS[layer_idx]) # move to the place pose for the correct layer
         else:
             self.arm.move_joint(STORAGE_POSES_JOINTS[destination])
 
@@ -486,16 +454,14 @@ class Orchestrator(Node):
             self.get_logger().info(f"=== {task['object']} -> {task['destination']} from HOME_POSES[{home_idx}] ===")
             self.get_logger().info(f'Moving to HOME_POSES[{home_idx}]...')
             self.arm.move_joint(HOME_POSES_JOINTS[home_idx])
-            time.sleep(self.settle)
 
             # Fresh near-top-down localize for THIS object (accurate grasp pose).
-            acc = self.detect_and_lift([task['object'].strip().lower()], [task])
-            if acc is None:
+            pose_opt = self.detect_and_lift([task['object'].strip().lower()], [task])
+            if pose_opt is None:
                 self.get_logger().warn(
                     f"Couldn't acquire {task['object']} from HOME_POSES[{home_idx}]; "
                     'skipping (no re-scout in this design).')
                 continue
-            _, _, pose_opt, obj_bl = acc
 
             # One attempt; not retried on failure (survey-once design).
             self.grasp_and_place(pose_opt, task['destination'].strip().lower())

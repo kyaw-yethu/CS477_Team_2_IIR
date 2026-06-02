@@ -105,7 +105,6 @@ class PerceptionNode(Node):
         # Drop whole-scene / whole-arm garbage boxes (>= 1.0 disables).
         self.declare_parameter('max_area_frac', 0.15)
         self.declare_parameter('save_annotated', True)
-        self.declare_parameter('annotated_dir', '/detections')
 
         api_key = os.getenv('GEMINI_API_KEY') \
             or self.get_parameter('api_key').get_parameter_value().string_value
@@ -125,12 +124,6 @@ class PerceptionNode(Node):
             'scene': self.get_parameter('scene_optical_frame').value,
             'wrist': self.get_parameter('wrist_optical_frame').value,
         }
-
-        self.save_annotated = bool(self.get_parameter('save_annotated').value)
-        self.annotated_dir = self.get_parameter('annotated_dir').value
-        if self.save_annotated:
-            os.makedirs(self.annotated_dir, exist_ok=True)
-            self.get_logger().info(f'Annotated frames -> {self.annotated_dir}')
 
         self.get_logger().info(
             f'Gemini two-camera backend, model={self.model}, '
@@ -175,7 +168,7 @@ class PerceptionNode(Node):
         except Exception as e:
             self.get_logger().error(f'cv_bridge error ({cam}): {e}')
 
-    def on_detect_request(self, request, response):
+    def on_detect_request(self, request, response, save_annotated=True):
         """Reads the CURRENT frame from the requested camera and detects the
         requested classes on it."""
         try:
@@ -231,7 +224,7 @@ class PerceptionNode(Node):
         out.data = payload
         self.pub.publish(out)
 
-        if self.save_annotated:
+        if save_annotated:
             try:
                 path = self.save_overlay(frame, detections, camera)
                 self.get_logger().info(f'Saved annotated frame -> {path}')
@@ -259,7 +252,6 @@ class PerceptionNode(Node):
         prompt = self._build_prompt(classes)
         resp = self.client.models.generate_content(model=self.model, contents=[pil, prompt])
         text = resp.text or ''
-        self.get_logger().info(f'Gemini raw: {text.strip()}')
 
         detections = self._parse(text, classes, w, h)
         detections = self._filter_oversize(detections, w, h)
@@ -324,7 +316,7 @@ class PerceptionNode(Node):
                     f'({(x2-x1)*(y2-y1)/img_area:.0%} of frame)')
         return kept
 
-    def save_overlay(self, bgr, detections, camera):
+    def save_overlay(self, bgr, detections, camera, annotated_dir='/ros2_ws/src/team_2/detections'):
         rgb = bgr[:, :, ::-1]
         img = PILImage.fromarray(np.ascontiguousarray(rgb))
         draw = ImageDraw.Draw(img)
@@ -349,7 +341,8 @@ class PerceptionNode(Node):
             draw.text((x1 + 3, ty + 2), tag, fill=(0, 0, 0), font=font)
 
         stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
-        path = os.path.join(self.annotated_dir, f'det_{camera}_{stamp}.png')
+        os.makedirs(annotated_dir, exist_ok=True)
+        path = os.path.join(annotated_dir, f'det_{camera}_{stamp}.png')
         img.save(path)
         return path
 
