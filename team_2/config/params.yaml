@@ -24,4 +24,4 @@ perception_node:
     text_threshold: 0.25   # query-match strength; raise if wrong labels stick.
     device: auto           # auto -> cuda if available else cpu.
     save_annotated: true   # write annotated frames to disk for debugging.
-    annotated_dir: /models/detections  # HOST-mounted -> appears on host directly.
+    annotated_dir: /detections  # HOST-mounted -> appears on host directly.

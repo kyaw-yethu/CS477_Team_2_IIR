@@ -45,7 +45,7 @@ class GraspServerNode(Node):
         self.declare_parameter('points_topic', '/wrist_camera/wrist_camera/depth/color/points')
         self.declare_parameter('optical_frame', 'wrist_camera_color_optical_frame')
         # How far below the topmost point (metres) to average for the grasp centre (default: 2 cm)
-        self.declare_parameter('top_slab_m', 0.03)
+        self.declare_parameter('top_slab_m', 0.05)
 
         self.optical_frame = self.get_parameter('optical_frame').value
         self.top_slab = float(self.get_parameter('top_slab_m').value)
@@ -76,8 +76,23 @@ class GraspServerNode(Node):
             'grasp_server: STANDBY (serving '
             f"'{self.get_parameter('lift_service').value}')")
 
+    def _principal_axis_yaw(self, points):
+        """Long-axis angle (rad, about optical +Z) of the points' XY footprint.
+        PCA: principal eigenvector of the 2D covariance. The 180° sign ambiguity of
+        the eigenvector doesn't matter — the orchestrator folds the angle into
+        [0, pi) anyway (jaws are symmetric under 180°)."""
+        xy = points[:, :2].astype(np.float64)
+        if len(xy) < 3:
+            return 0.0
+        xy = xy - xy.mean(axis=0)
+        cov = np.cov(xy, rowvar=False)
+        if not np.all(np.isfinite(cov)):
+            return 0.0
+        evals, evecs = np.linalg.eigh(cov)        # ascending
+        major = evecs[:, int(np.argmax(evals))]   # principal direction
+        return float(np.arctan2(major[1], major[0]))
 
-    def save_xy_plot(self, valid_points, target_points, mean_pt,
+    def save_xy_plot(self, valid_points, target_points, mean_pt, yaw=None,
                  out_dir='/ros2_ws/src/team_2/debug'):
         """Top-down + image-plane scatter of the ROI cloud and the grasp mean.
 
@@ -104,13 +119,21 @@ class GraspServerNode(Node):
         ax_img.set_title('Image plane  X-Y'); ax_img.invert_yaxis()
         ax_img.set_aspect('equal', 'box'); ax_img.grid(True, alpha=0.3)
 
+        if yaw is not None:
+            L = 0.05  # 5 cm half-length
+            dx, dy = np.cos(yaw), np.sin(yaw)
+            ax_img.plot([mean_pt[0] - L*dx, mean_pt[0] + L*dx],
+                        [mean_pt[1] - L*dy, mean_pt[1] + L*dy],
+                        c='tab:green', lw=2, label='long axis')
+            ax_img.legend(fontsize=8)
+
         fig.suptitle(f'grasp mean (optical) = '
                     f'({mean_pt[0]:.3f}, {mean_pt[1]:.3f}, {mean_pt[2]:.3f}) m')
         fig.tight_layout()
         stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
         path = os.path.join(out_dir, f'grasp_xy_{stamp}.png')
         fig.savefig(path, dpi=120); plt.close(fig)
-        self.get_logger().info(f'Saved grasp plot -> {path}')
+        # self.get_logger().info(f'Saved grasp plot -> {path}')
         return path
 
     def points_callback(self, msg):
@@ -140,19 +163,24 @@ class GraspServerNode(Node):
             return response
 
         # NOTE: get_bbox_center_3d expects (top, left, bottom, right) = (py1, px1, py2, px2).
-        center_3d = self.get_bbox_center_3d(y1, x1, y2, x2)
-
-        if center_3d is None:
+        result = self.get_bbox_center_3d(y1, x1, y2, x2)
+        if result is None:
             self.get_logger().info('No valid depth in bbox; returning empty Pose.')
             response.pose = Pose()        # all-zero -> orchestrator skips
             return response
+
+        center_3d, yaw = result
 
         p = Pose()
         p.position.x = float(center_3d[0])
         p.position.y = float(center_3d[1])
         p.position.z = float(center_3d[2])
+        # long axis packed as a rotation about optical +Z; orchestrator decodes
+        # it with 2*atan2(q.z, q.w).
+        p.orientation.z = float(np.sin(yaw / 2.0))
+        p.orientation.w = float(np.cos(yaw / 2.0))
         response.pose = p
-        self.get_logger().info(f'3D centre (optical frame): {center_3d}')
+        self.get_logger().info(f'3D centre (optical): {center_3d}, long-axis yaw: {np.degrees(yaw):.0f} deg')
         return response
 
     # ---- From example5 -------------------------------------------
@@ -198,11 +226,12 @@ class GraspServerNode(Node):
 
         # 4. Mean of the top slab.
         mean_pt = np.mean(target_points, axis=0)
+        yaw = self._principal_axis_yaw(target_points)
         try:
-            self.save_xy_plot(valid_points, target_points, mean_pt)
+            self.save_xy_plot(valid_points, target_points, mean_pt, yaw)
         except Exception as e:
             self.get_logger().warn(f'plot failed: {e}')
-        return mean_pt
+        return mean_pt, yaw
 
     def publish_roi_cloud(self, valid_points, frame_id='wrist_camera_color_optical_frame'):
         """
