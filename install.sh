@@ -2,7 +2,7 @@
 
 # Install dependencies
 sudo apt-get -y update
-sudo xargs -a ./src/CS477_Team_2_IRR/apt-packages.txt apt install -y
+sudo xargs -a ./src/CS477_Team_2_IIR/apt-packages.txt apt install -y
 
 # Install realsense2 camera SDK
 sudo mkdir -p /etc/apt/keyrings
@@ -13,21 +13,21 @@ sudo apt-get -y install librealsense2-dkms librealsense2-utils librealsense2-dev
 
 # Install default requirements
 pip install --upgrade pip
-pip install -r ./src/CS477_Team_2_IRR/requirements.txt
+pip install -r ./src/CS477_Team_2_IIR/requirements.txt
 pip install "setuptools<66.0"
 
 # Install moveit
-sudo cp ./src/cs477_IIR/utils/include/move_group_interface_improved.h /opt/ros/humble/include/moveit/move_group_interface/
-vcs import --input src/CS477_Team_2_IRR/docs/common_sim.repos --workers 1
+sudo cp ./src/CS477_Team_2_IIR/utils/include/move_group_interface_improved.h /opt/ros/humble/include/moveit/move_group_interface/
+vcs import --input src/CS477_Team_2_IIR/docs/common_sim.repos --workers 1
 
 #source /opt/ros/humble/setup.bash
 #rosdep install -i --from-path src --rosdistro humble --skip-keys gazebo_grasp_plugin gazebo_version_helpers roboticsgroup_upatras_gazebo_plugins -y -r
 rosdep install -i --from-path src --rosdistro humble -y -r
 
 # Install binary packages
-sudo dpkg -i ./src/cs477_IIR/ros-humble-gazebo-grasp-plugin_1.0.2-0jammy_amd64.deb
-sudo dpkg -i ./src/cs477_IIR/ros-humble-gazebo-version-helpers_0.0.0-0jammy_amd64.deb
-sudo dpkg -i ./src/cs477_IIR/ros-humble-roboticsgroup-upatras-gazebo-plugins_0.2.0-0jammy_amd64.deb
+sudo dpkg -i ./src/CS477_Team_2_IIR/ros-humble-gazebo-grasp-plugin_1.0.2-0jammy_amd64.deb
+sudo dpkg -i ./src/CS477_Team_2_IIR/ros-humble-gazebo-version-helpers_0.0.0-0jammy_amd64.deb
+sudo dpkg -i ./src/CS477_Team_2_IIR/ros-humble-roboticsgroup-upatras-gazebo-plugins_0.2.0-0jammy_amd64.deb
 
 export PYTHONNOUSERSITE=1
 
