@@ -694,3 +694,48 @@ if __name__ == '__main__':
         
 
     
+    def pose_to_joints(self, target_pose, duration=5.0, max_iter=500):
+        """
+        Compute joint angles for a target Pose using Jacobian pseudo-inverse IK.
+        Returns a list of joint angles, or None if IK fails.
+        """
+        try:
+            import PyKDL
+            from assignment_1 import misc
+            from hrl_geom.pose_converter import PoseConv
+
+            q = np.array(self.js_joint_position, dtype=float).flatten()
+            target_frame = misc.pose2KDLframe(self.detachTool(target_pose))
+
+            for _ in range(max_iter):
+                current_homo = self.arm_kdl.forward(q)
+                pos, quat = PoseConv.to_pos_quat(current_homo)
+                current_pose = misc.list2Pose(list(pos) + list(quat))
+                current_frame = misc.pose2KDLframe(current_pose)
+
+                dp = np.array([
+                    target_frame.p.x() - current_frame.p.x(),
+                    target_frame.p.y() - current_frame.p.y(),
+                    target_frame.p.z() - current_frame.p.z()])
+
+                dR = current_frame.M.Inverse() * target_frame.M
+                angle, axis = dR.GetRotAngle()
+                do_ = current_frame.M * PyKDL.Vector(
+                    axis.x()*angle, axis.y()*angle, axis.z()*angle)
+                do = np.array([do_.x(), do_.y(), do_.z()])
+
+                dx = np.concatenate([dp, do])
+                if np.linalg.norm(dx) < 1e-4:
+                    return q.tolist()
+
+                J = np.array(self.arm_kdl.jacobian(q))
+                J_inv = np.linalg.pinv(J)
+                dq = (J_inv @ dx).flatten()
+                q = q + 0.1 * dq  # small step
+
+            self.get_logger().warn('pose_to_joints: max iterations reached')
+            return q.tolist()  # return best estimate
+
+        except Exception as e:
+            self.get_logger().error(f'pose_to_joints failed: {e}')
+            return None

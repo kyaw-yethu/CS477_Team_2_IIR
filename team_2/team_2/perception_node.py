@@ -88,7 +88,7 @@ class PerceptionNode(Node):
             api_key = self.get_parameter('api_key').get_parameter_value().string_value
         
         self.declare_parameter('api_key', api_key)
-        self.declare_parameter('model', 'gemini-3-flash-preview')
+        self.declare_parameter('model', 'gemini-2.5-flash')
 
         # --- cameras --------------------------------------------------------
         # Topic + optical frame for each camera. The optical frame is what the
