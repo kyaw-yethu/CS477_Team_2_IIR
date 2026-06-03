@@ -171,9 +171,10 @@ class Orchestrator(Node):
             while rclpy.ok() and not cli.wait_for_service(timeout_sec=1.0):
                 self.get_logger().info(f"Waiting for '{name}' service...")
 
-    def call_perception(self, names):
+    def call_perception(self, names, camera='wrist'):
+        """Request detection from specified camera ('wrist' or 'scene')."""
         req = DetectObjects.Request()
-        req.data = json.dumps(names)
+        req.data = json.dumps({'classes': names, 'camera': camera})
         fut = self.detect_cli.call_async(req)
         rclpy.spin_until_future_complete(self, fut)
         res = fut.result()
@@ -384,6 +385,9 @@ class Orchestrator(Node):
         lift each detection to a rough base_link position, and assign each task to
         the nearest-in-y HOME_POSES bucket.
 
+        If objects are missed on primary wrist-camera scout, try secondary detection
+        using the scene (overhead) camera from the same arm position for better accuracy.
+
         Returns (plan, missed):
           plan   : list of (task, home_idx), one per task we could place a bucket on
           missed : list of object names a task wanted but the scout never located
@@ -394,10 +398,12 @@ class Orchestrator(Node):
         the arm has moved.
         """
         names = sorted({t['object'].strip().lower() for t in tasks})
-        dets = self.call_perception(names)
+        
+        # Primary detection: wrist camera from scout pose (oblique angle)
+        dets = self.call_perception(names, camera='wrist')
 
         # Lift each detection once -> a located physical object with a coarse y.
-        located = []   # [{'obj': str, 'y': float, 'claimed': bool}, ...]
+        located = []   # [{'obj': str, 'y': float, 'claimed': bool, 'camera': str}, ...]
         for det in dets:
             pose_opt = self.call_lift(det['bbox'])
             if pose_opt is None:
@@ -407,11 +413,10 @@ class Orchestrator(Node):
                 continue
             idx = self.select_home_pose(bl.position.y)
             located.append({'obj': det['object'].strip().lower(),
-                            'y': bl.position.y, 'claimed': False})
+                            'y': bl.position.y, 'claimed': False, 'camera': 'wrist'})
             self.get_logger().info(f"======={det['object']} belongs to the HOME_POSES[{idx}]======")
 
-        # Pair each task with an unclaimed located object of the same type, so
-        # duplicates of one type get spread across their real buckets.
+        # Pair each task with an unclaimed located object of the same type.
         plan, missed = [], []
         for task in tasks:
             obj = task['object'].strip().lower()
@@ -421,6 +426,35 @@ class Orchestrator(Node):
                 continue
             cand['claimed'] = True
             plan.append((task, self.select_home_pose(cand['y'])))
+        
+        # If we missed objects, try secondary detection using scene camera (overhead view, same arm position)
+        if missed:
+            self.get_logger().info(f'Attempting secondary scout (scene camera) for missed: {missed}')
+            dets_scene = self.call_perception(missed, camera='scene')
+            
+            for det in dets_scene:
+                obj_lower = det['object'].strip().lower()
+                # Skip if already located at primary scout (wrist camera).
+                if any(L['obj'] == obj_lower and not L['claimed'] for L in located):
+                    continue
+                    
+                pose_opt = self.call_lift(det['bbox'])
+                if pose_opt is None:
+                    continue
+                bl = self.transform_pose(pose_opt, self.optical_frame, self.base_frame)
+                if bl is None:
+                    continue
+                idx = self.select_home_pose(bl.position.y)
+                located.append({'obj': obj_lower, 'y': bl.position.y, 'claimed': False, 'camera': 'scene'})
+                self.get_logger().info(
+                    f'[SCENE CAMERA] {det["object"]} -> HOME[{idx}] (confidence: {det.get("conf", "N/A")})')
+                # Retry plan for this object.
+                for task in tasks:
+                    if task['object'].strip().lower() == obj_lower:
+                        missed.remove(obj_lower) if obj_lower in missed else None
+                        plan.append((task, idx))
+                        break
+        
         return plan, missed
 
     # ---- main loop ----------------------------------------------------------

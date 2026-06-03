@@ -115,6 +115,13 @@ class PerceptionNode(Node):
 
         self.model = self.get_parameter('model').value
         self.client = genai.Client(api_key=api_key)
+        
+        # Fallback models if primary is unavailable
+        self.fallback_models = [
+            'gemini-2-5-flash',
+            'gemini-2-5-flash-lite',
+            'gemini-1-5-flash',
+        ]
 
         self.default_camera = self.get_parameter('default_camera').value
         self.max_area_frac = float(self.get_parameter('max_area_frac').value)
@@ -244,18 +251,50 @@ class PerceptionNode(Node):
 
     def detect(self, bgr, classes):
         """One Gemini call detects every instance of every requested class on
-        the given frame."""
+        the given frame. Includes fallback to alternative models if primary fails."""
         rgb = bgr[:, :, ::-1]                       # BGR (cv_bridge) -> RGB
         pil = PILImage.fromarray(np.ascontiguousarray(rgb))
         h, w = bgr.shape[:2]
 
         prompt = self._build_prompt(classes)
-        resp = self.client.models.generate_content(model=self.model, contents=[pil, prompt])
-        text = resp.text or ''
-
-        detections = self._parse(text, classes, w, h)
-        detections = self._filter_oversize(detections, w, h)
-        return detections
+        
+        # Try primary model first, then fallbacks
+        models_to_try = [self.model] + self.fallback_models
+        last_error = None
+        
+        for model in models_to_try:
+            try:
+                self.get_logger().info(f'Attempting detection with model: {model}')
+                resp = self.client.models.generate_content(model=model, contents=[pil, prompt])
+                text = resp.text or ''
+                
+                detections = self._parse(text, classes, w, h)
+                detections = self._filter_oversize(detections, w, h)
+                
+                if model != self.model:
+                    self.get_logger().warn(f'Primary model unavailable; used fallback: {model}')
+                
+                return detections
+                
+            except Exception as e:
+                error_str = str(e)
+                last_error = e
+                # Skip quota errors (429) - they'll retry later, don't waste fallbacks
+                if '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str:
+                    self.get_logger().error(f'Model {model} quota exhausted (429). All models hit quota limit.')
+                    raise RuntimeError(f'All models have exhausted free tier quota. Error: {e}')
+                # Skip unavailable models (404) - try next one
+                elif '404' in error_str or 'NOT_FOUND' in error_str:
+                    self.get_logger().warn(f'Model {model} not found (404): trying next fallback...')
+                    continue
+                else:
+                    self.get_logger().warn(f'Model {model} failed: {e}')
+                    continue
+        
+        # All models failed
+        if last_error:
+            raise last_error
+        raise RuntimeError('No models available for detection')
 
     def _build_prompt(self, classes):
         names = ', '.join(classes)
