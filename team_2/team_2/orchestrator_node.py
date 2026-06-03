@@ -114,7 +114,7 @@ POST_SHELF_POSES_JOINTS = [
 # base_link, the jaws must close ACROSS it (perpendicular) -> +90°. If grasps
 # come out rotated 90° (jaws along the long axis instead), flip this to 0.0.
 # One-time calibration; depends on which way the borrowed FK gripper opens.
-GRIPPER_YAW_OFFSET = math.pi / 2.0
+GRIPPER_YAW_OFFSET = 0.0
 # -----------------------------------------------------------------------------
 
 

@@ -249,21 +249,30 @@ class PerceptionNode(Node):
         })
         return response
 
-    def detect(self, bgr, classes):
-        """One Gemini call detects every instance of every requested class on
-        the given frame."""
-        rgb = bgr[:, :, ::-1]                       # BGR (cv_bridge) -> RGB
+    def detect(self, bgr, classes, max_retries=3, retry_delay=3.0):
+        """One Gemini call detects every instance of every requested class.
+        Retries on 503/empty with exponential backoff."""
+        import time
+        rgb = bgr[:, :, ::-1]
         pil = PILImage.fromarray(np.ascontiguousarray(rgb))
         h, w = bgr.shape[:2]
-
         prompt = self._build_prompt(classes)
-        resp = self.client.models.generate_content(model=self.model, contents=[pil, prompt])
-        text = resp.text or ''
-        self.get_logger().info(f'Gemini raw: {text.strip()}')
-
-        detections = self._parse(text, classes, w, h)
-        detections = self._filter_oversize(detections, w, h)
-        return detections
+        for attempt in range(max_retries):
+            try:
+                resp = self.client.models.generate_content(model=self.model, contents=[pil, prompt])
+                text = resp.text or ""
+                self.get_logger().info(f"Gemini raw: {text.strip()}")
+                detections = self._parse(text, classes, w, h)
+                detections = self._filter_oversize(detections, w, h)
+                if detections:
+                    return detections
+                self.get_logger().warn(f"Gemini empty (attempt {attempt+1}/{max_retries}), retrying...")
+                time.sleep(retry_delay * (attempt + 1))
+            except Exception as e:
+                self.get_logger().warn(f"Gemini error (attempt {attempt+1}/{max_retries}): {e}")
+                time.sleep(retry_delay * (attempt + 1))
+        self.get_logger().error(f"Gemini failed after {max_retries} attempts")
+        return []
 
     def _build_prompt(self, classes):
         names = ', '.join(classes)
