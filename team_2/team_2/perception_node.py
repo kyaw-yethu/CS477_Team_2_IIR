@@ -39,10 +39,13 @@ WHY TWO CAMERAS (the geometry that forces this)
       bbox against the wrist cloud. A scene bbox + wrist cloud silently returns
       garbage 3D. <<<
 
-RUNTIME REQUIREMENT: needs INTERNET + a Gemini API key (same caveat as the
-single-camera Gemini node). Pass it in:
+RUNTIME REQUIREMENT: needs INTERNET + an API key. Gemini is used if GEMINI_API_KEY
+is present; otherwise it falls back to OpenAI via OPENAI_API_KEY. Pass whichever
+you have in:
     sudo docker run ... -e GEMINI_API_KEY="..." image_team_2
-or set the 'api_key' ROS param.
+    sudo docker run ... -e OPENAI_API_KEY="..." image_team_2
+or set the 'api_key' / 'openai_api_key' ROS param. Box parsing is shared across
+both backends (see _parse / _BOX_RE).
 
 Gemini box convention (AI Studio docs, same as example4/5): boxes come back as
 [ymin, xmin, ymax, xmax] normalized 0-1000. If overlays look transposed, that's
@@ -51,6 +54,8 @@ the first thing to flip in _parse().
 import os
 import re
 import json
+import base64
+from io import BytesIO
 from functools import partial
 from datetime import datetime
 
@@ -65,7 +70,16 @@ from std_msgs.msg import String
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 
-from google import genai
+# Either backend may be absent from the image; import lazily so the node can
+# still run on whichever one is installed + keyed.
+try:
+    from google import genai
+except ImportError:
+    genai = None
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
 from team_2_interfaces.srv import DetectObjects
 
@@ -82,13 +96,14 @@ class PerceptionNode(Node):
     def __init__(self):
         super().__init__('perception_node')
 
-        # --- API / model ----------------------------------------------------
-        api_key = os.getenv('GEMINI_API_KEY')
-        if not api_key:
-            api_key = self.get_parameter('api_key').get_parameter_value().string_value
-        
-        self.declare_parameter('api_key', api_key)
+        # --- API keys / models ----------------------------------------------
+        # Declare params up front (the old code read 'api_key' before declaring
+        # it, which raised whenever GEMINI_API_KEY was unset -- the exact case
+        # the OpenAI fallback is meant to cover). Backend is chosen below.
+        self.declare_parameter('api_key', '')           # Gemini key (env wins)
+        self.declare_parameter('openai_api_key', '')    # OpenAI key (env wins)
         self.declare_parameter('model', 'gemini-3-flash-preview')
+        self.declare_parameter('openai_model', 'gpt-5-mini')
 
         # --- cameras --------------------------------------------------------
         # Topic + optical frame for each camera. The optical frame is what the
@@ -106,22 +121,43 @@ class PerceptionNode(Node):
         self.declare_parameter('max_area_frac', 0.15)
         self.declare_parameter('save_annotated', True)
 
-        api_key = os.getenv('GEMINI_API_KEY') \
+        # --- backend selection ----------------------------------------------
+        # Gemini wins if its key is present; otherwise fall back to OpenAI.
+        # Env vars take precedence over the corresponding ROS params.
+        gemini_key = os.getenv('GEMINI_API_KEY') \
             or self.get_parameter('api_key').get_parameter_value().string_value
-        if not api_key:
-            raise ValueError(
-                'Gemini API key is not set. Set the GEMINI_API_KEY environment '
-                "variable or provide the 'api_key' ROS parameter.")
+        openai_key = os.getenv('OPENAI_API_KEY') \
+            or self.get_parameter('openai_api_key').get_parameter_value().string_value
 
-        self.model = self.get_parameter('model').value
-        self.client = genai.Client(api_key=api_key)
-        
-        # Fallback models if primary is unavailable
+        # Gemini-only: tried in order after the primary model on 404s.
         self.fallback_models = [
             'gemini-2-5-flash',
             'gemini-2-5-flash-lite',
             'gemini-1-5-flash',
         ]
+
+        if gemini_key:
+            if genai is None:
+                raise ImportError(
+                    "GEMINI_API_KEY is set but the 'google-genai' package is "
+                    'not installed in this image.')
+            self.backend = 'gemini'
+            self.model = self.get_parameter('model').value
+            self.client = genai.Client(api_key=gemini_key)
+        elif openai_key:
+            if OpenAI is None:
+                raise ImportError(
+                    "OPENAI_API_KEY is set but the 'openai' package is not "
+                    'installed in this image.')
+            self.backend = 'openai'
+            self.model = self.get_parameter('openai_model').value
+            self.client = OpenAI(api_key=openai_key)
+            self.fallback_models = []
+        else:
+            raise ValueError(
+                'No detection API key found. Set GEMINI_API_KEY (Gemini) or '
+                'OPENAI_API_KEY (OpenAI) as an environment variable, or provide '
+                "the 'api_key' / 'openai_api_key' ROS parameter.")
 
         self.default_camera = self.get_parameter('default_camera').value
         self.max_area_frac = float(self.get_parameter('max_area_frac').value)
@@ -133,7 +169,7 @@ class PerceptionNode(Node):
         }
 
         self.get_logger().info(
-            f'Gemini two-camera backend, model={self.model}, '
+            f'{self.backend} two-camera backend, model={self.model}, '
             f'default_camera={self.default_camera}')
 
         self.bridge = CvBridge()
@@ -250,32 +286,43 @@ class PerceptionNode(Node):
         return response
 
     def detect(self, bgr, classes):
-        """One Gemini call detects every instance of every requested class on
-        the given frame. Includes fallback to alternative models if primary fails."""
+        """Detect every instance of every requested class on the given frame.
+
+        Prepares the image + prompt once, dispatches the raw text generation to
+        the active backend, then parses/filters identically for both. The box
+        prompt (0-1000 normalized [ymin, xmin, ymax, xmax]) is shared, so a
+        single _parse() handles Gemini and OpenAI output alike."""
         rgb = bgr[:, :, ::-1]                       # BGR (cv_bridge) -> RGB
         pil = PILImage.fromarray(np.ascontiguousarray(rgb))
         h, w = bgr.shape[:2]
 
         prompt = self._build_prompt(classes)
-        
-        # Try primary model first, then fallbacks
+
+        if self.backend == 'gemini':
+            text = self._infer_gemini(pil, prompt)
+        else:
+            text = self._infer_openai(pil, prompt)
+
+        detections = self._parse(text, classes, w, h)
+        detections = self._filter_oversize(detections, w, h)
+        return detections
+
+    def _infer_gemini(self, pil, prompt):
+        """Gemini call with fallback to alternative models if the primary is
+        unavailable (404). Returns raw response text."""
         models_to_try = [self.model] + self.fallback_models
         last_error = None
-        
+
         for model in models_to_try:
             try:
                 self.get_logger().info(f'Attempting detection with model: {model}')
                 resp = self.client.models.generate_content(model=model, contents=[pil, prompt])
-                text = resp.text or ''
-                
-                detections = self._parse(text, classes, w, h)
-                detections = self._filter_oversize(detections, w, h)
-                
+
                 if model != self.model:
                     self.get_logger().warn(f'Primary model unavailable; used fallback: {model}')
-                
-                return detections
-                
+
+                return resp.text or ''
+
             except Exception as e:
                 error_str = str(e)
                 last_error = e
@@ -290,11 +337,40 @@ class PerceptionNode(Node):
                 else:
                     self.get_logger().warn(f'Model {model} failed: {e}')
                     continue
-        
+
         # All models failed
         if last_error:
             raise last_error
         raise RuntimeError('No models available for detection')
+
+    def _infer_openai(self, pil, prompt):
+        """OpenAI vision call. Sends the frame as a base64 data URL alongside
+        the same box prompt and returns raw message text for _parse().
+
+        NOTE: general-purpose vision models localize less precisely than Gemini;
+        treat coke-can-level grasp boxes from this path as coarser. The 'model'
+        is the 'openai_model' ROS param (default gpt-4o)."""
+        buf = BytesIO()
+        pil.save(buf, format='PNG')
+        b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+
+        self.get_logger().info(f'Attempting detection with model: {self.model}')
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            temperature=0.0,
+            messages=[{
+                'role': 'user',
+                'content': [
+                    {'type': 'text', 'text': prompt},
+                    {'type': 'image_url',
+                     'image_url': {
+                         'url': f'data:image/png;base64,{b64}',
+                         'detail': 'high',
+                     }},
+                ],
+            }],
+        )
+        return resp.choices[0].message.content or ''
 
     def _build_prompt(self, classes):
         names = ', '.join(classes)
