@@ -95,6 +95,18 @@ class GraspServerNode(Node):
         if not np.all(np.isfinite(cov)):
             return 0.0
         evals, evecs = np.linalg.eigh(cov)        # ascending
+        # If the two eigenvalues are nearly equal the footprint is close to
+        # circular (e.g. a can top). The principal direction becomes noisy
+        # and can cause arbitrary gripper spins — detect that and return a
+        # stable zero yaw instead of an unstable angle.
+        small = 1e-12
+        ev0 = max(evals[0], small)
+        ev1 = max(evals[1], small)
+        ratio = ev1 / ev0
+        if ratio < 1.2:
+            # near-isotropic footprint -> no reliable long axis
+            self.get_logger().info('PCA: near-circular footprint, skipping yaw spin')
+            return 0.0
         major = evecs[:, int(np.argmax(evals))]   # principal direction
         return float(np.arctan2(major[1], major[0]))
 
@@ -159,9 +171,18 @@ class GraspServerNode(Node):
         xy = points[:, :2].astype(np.float64)
         u = np.array([np.cos(yaw), np.sin(yaw)])           # long-axis direction
         t = (xy - xy.mean(axis=0)) @ u                     # coord along long axis
-        band = np.abs(t - np.median(t)) <= max(0.01, 0.10 * np.ptp(t))
-        slice_pts = points[band] if band.any() else points
-        center = slice_pts.mean(axis=0)
+        # If the spread along the chosen axis is very small (near-circular
+        # footprint or unreliable yaw), avoid a thin slice which can bias the
+        # centroid toward one side; instead use the full target_points centroid.
+        spread = np.ptp(t)
+        if spread <= 0.01:
+            slice_pts = points
+            center = slice_pts.mean(axis=0)
+            self.get_logger().info('Grasp center: using full centroid for near-circular object')
+        else:
+            band = np.abs(t - np.median(t)) <= max(0.01, 0.10 * spread)
+            slice_pts = points[band] if band.any() else points
+            center = slice_pts.mean(axis=0)
         k = int(np.argmin(np.sum((points - center) ** 2, axis=1)))
         return points[k]                                   # snapped onto the object
 
