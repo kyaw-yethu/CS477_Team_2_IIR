@@ -78,7 +78,7 @@ def gripperGotoPos(node, pos, force=1., timeout=3,
         rclpy.spin_until_future_complete(node, goal_future)
 
         goal_handle = goal_future.result()
-        node.get_logger().info('goal_handle:\n {}'.format(goal_handle))
+        # node.get_logger().info('goal_handle:\n {}'.format(goal_handle))
     
         # Wait until the execution ends and return the result
         result_future = goal_handle.get_result_async()

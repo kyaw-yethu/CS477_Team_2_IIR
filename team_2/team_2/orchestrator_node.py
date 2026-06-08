@@ -60,7 +60,7 @@ def make_pose(x, y, z, roll, pitch, yaw):
 # --- POSITIONS ----------------------------------------------------------------
 # x, y, z, roll, pitch, yaw (radians)
 HOME_POSES = [
-    (0.55,  0.35, 0.60, -math.pi, 0.0, 0.0),
+    (0.55,  0.4, 0.60, -math.pi, 0.0, 0.0),
     (0.55,  0.05, 0.60, -math.pi, 0.0, 0.0),
     (0.55, -0.20, 0.60, -math.pi, 0.0, 0.0),
 ]
@@ -68,17 +68,18 @@ HOME_POSES = [
 # SCOUT_POSE   = (-0.20, -0.05, 0.45, 3 * math.pi/4, 0.0, math.pi/2)
 
 # PRE_SHELF_POSES = [
-#     # (1.15, 0.3, 0.05, math.pi/2, 0.0, 0.0),
-#     # (1.15, 0.3, 0.30, math.pi/2, 0.0, 0.0),
+#     (1.15, 0.3, 0.05, math.pi/2, 0.0, 0.0),
+#     (1.15, 0.3, 0.30, math.pi/2, 0.0, 0.0),
 #     (0.60, -0.33, 0.50, math.pi/2, 0.0, math.pi/2)
 # ]
 
 
 # POST_SHELF_POSES = [
-#     (1.15, -0.35, 0.05, math.pi/2, 0.0, 0.0),
-#     (1.15, -0.35, 0.30, math.pi/2, 0.0, 0.0),
-#     (1.00, -0.33, 0.50, math.pi/2, 0.0, math.pi/2)
+#     (1.15, -0.32, 0.025, math.pi/2+0.3, 0.0, 0.0),
+#     (1.15, -0.32, 0.28, math.pi/2+0.3, 0.0, 0.0),
+#     (1.00, -0.33, 0.52, math.pi/2+0.4, 0.0, math.pi/2)
 # ]
+
 
 # STORAGE_POSES = {
 #     'left_storage':  (-0.05,  0.60, 0.25, math.pi, 0.0, 0.0),
@@ -86,7 +87,7 @@ HOME_POSES = [
 # }
 
 HOME_POSES_JOINTS = [
-                [0.3562841841001843, -0.9628604728892204, 0.011549683289610273, -0.632696892891174, -1.5702528606004802, 1.9182459455950602],
+                [0.4486239282397744, -0.919427693246301, -0.0009643325054386759, -0.6664451503075698, -1.5698670094956702, 2.0186363613790976],
                 [-0.09760216271339925, -1.041465208208678, 0.007976593885553171, -0.5451334190770651, -1.570210237498598, 1.4776046285377251],
                 [-0.5355024046855043, -1.0059814986612452, 0.002029311252828683, -0.5756700956254002, -1.5698330212301568, 1.0396796225880653]
             ]         
@@ -105,9 +106,9 @@ PRE_SHELF_POSES_JOINTS = [
                 ]
 
 POST_SHELF_POSES_JOINTS = [
-    [-0.1001950339110103, 0.03066953328747561, -0.00021623515338185738, -1.5241709836884587, -3.1503408239070074, 1.6483366493474607],
-    [-0.11255248968737187, -0.17735367529810056, -0.006038652614095945, -1.577814610424966, -3.12448853397301, 1.3799779404378971],
-    [-0.5558515282526402, -0.45263417722776306, 0.17613617529742698, -2.8599554581953335, -1.0168549357011385, -0.0028841526061399313]
+    [-0.13535970323704163, 0.023049948383443927, -0.04203316177540594, -1.750520392646267, -2.850942302274265, 1.3479522636327192],
+    [-0.1582175292289698, -0.20618354710604558, -0.0364649370185775, -1.6509244782416772, -2.8357651870951144, 1.2233524083046359],
+    [-0.5504861307885196, -0.6772529340569791, 0.37828048434279177, -2.39458452572829, -1.0650724776737845, -0.22683857683566672]
 ]
 
 GRIPPER_YAW_OFFSET = math.pi / 2.0
@@ -123,11 +124,13 @@ class Orchestrator(Node):
         self.declare_parameter('lift_service', 'lift_bbox_to_3d')
         self.declare_parameter('camera_optical_frame', 'wrist_camera_color_optical_frame')
         self.declare_parameter('base_frame', 'base_link')
-        self.declare_parameter('time_budget_sec', 300.0)
+        self.declare_parameter('max_pick_passes', 3)
+        self.declare_parameter('elbow_floor_z', 0.20)
 
         self.optical_frame = self.get_parameter('camera_optical_frame').value
         self.base_frame = self.get_parameter('base_frame').value
-        self.time_budget = float(self.get_parameter('time_budget_sec').value)
+        self.max_pick_passes = int(self.get_parameter('max_pick_passes').value) 
+        self.elbow_floor_z = float(self.get_parameter('elbow_floor_z').value)  # <-- add
 
         self.tasks = None  # set when /parsed_tasks arrives -> leaves standby
 
@@ -314,12 +317,57 @@ class Orchestrator(Node):
         self.arm.move_joint(cur)
 
     def move_pose_by_joints(self, target):
-        q = self.arm.pose_to_joints(target)
+        """Move the EE to `target` in joint space on the elbow-up branch."""
+        q = self._solve_ik_elbow_up(target)
         if q is None:
-            self.get_logger().warn('approach: IK None -> move_pose fallback')
-            self.arm.move_pose(target)
-        else:
-            self.arm.move_joint(q)
+            return False
+        self.arm.move_joint(q)
+        return True
+
+    def _forearm_z(self, q):
+        """Elbow height (forearm_link origin z) in base_link at config q, via
+        the arm's own KDL chain -- this is what distinguishes the UR5's
+        elbow-up branch from the elbow-down one that drives the forearm into
+        the table."""
+        try:
+            T = np.asarray(self.arm.arm_kdl.forward(q, end_link='forearm_link'))
+            return float(T[2, 3])
+        except Exception as e:
+            self.get_logger().warn(f'_forearm_z: FK to forearm_link failed ({e}).')
+            return None   # can't gate -> caller trusts the raw solve
+
+    def _solve_ik_elbow_up(self, target):
+        """Joints that reach `target` on the elbow-UP branch. pose_to_joints
+        lands on whatever branch its seed + Cartesian path drift into, so we
+        solve, FK-check the elbow, and on a fold retry from seeds biased toward
+        elbow-up (and finally the curated HOME configs). Returns elbow-up
+        joints, or None if no seed produced one."""
+        cur = list(get_joint.get_joint_angles(self))
+
+        seeds = [cur]
+        for d in (0.4, 0.8):                 # shoulder_lift up + elbow folded in
+            s = list(cur); s[1] -= d; s[2] += d
+            seeds.append(s)
+        seeds.extend(HOME_POSES_JOINTS)      # known elbow-up fallbacks
+
+        best = None
+        for seed in seeds:
+            q = self.arm.pose_to_joints(target, q_seed=seed)
+            if q is None:
+                continue
+            z = self._forearm_z(q)
+            if z is None:                    # FK gate unavailable -> trust solve
+                return q
+            if best is None:
+                best = (q, z)
+            if z >= self.elbow_floor_z:
+                self.get_logger().info(f'IK elbow-up: forearm z={z:.3f}')
+                return q
+        if best is not None:
+            self.get_logger().warn(
+                f'IK: no elbow-up branch (best forearm z={best[1]:.3f} '
+                f'< floor={self.elbow_floor_z:.3f}).')
+        return None
 
     def grasp_and_place(self, obj_pose_optical, destination):
         """Adapted from example5 ObjectGraspClient.request_pick, plus a
@@ -346,15 +394,14 @@ class Orchestrator(Node):
         # ---3. descend, keeping the rotated orientation---
         cur = list(get_joint.get_joint_angles(self))
         goal.orientation = self.arm.fk_request(cur).orientation
-        goal.position.z -= 0.13
-        self.arm.move_pose(goal)
+        goal.position.z -= 0.12
+        self.move_pose_by_joints(goal)
 
         # ---4. grasp---
         move_gripper.gripper_close(self, force=0.5, gripper_close_pos=0.55)
 
-        # ---5. lift clear---
-        goal.position.z += 0.40
-        self.arm.move_pose(goal)
+        # ---5. lift up to the HOME POSE 1---
+        self.arm.move_joint(HOME_POSES_JOINTS[1]) # move to a middle home pose before going to the shelf to avoid collisions with the shelf when moving from the lift pose
 
         # ---6. carry to the storage and release---
         if destination == 'shelf':
@@ -364,18 +411,19 @@ class Orchestrator(Node):
                 idx for idx in reversed(range(len(self.shelf_layer_occupied)))
                 if self.shelf_layer_occupied[idx] == min_count
             )
-            self.arm.move_joint(HOME_POSES_JOINTS[1]) # move to a middle home pose before going to the shelf to avoid collisions with the shelf when moving from the lift pose
             self.arm.move_joint(PRE_SHELF_POSES_JOINTS[layer_idx]) # move to the pre-place pose for the correct layer
             self.arm.move_joint(POST_SHELF_POSES_JOINTS[layer_idx]) # move to the place pose for the correct layer
         else:
             self.arm.move_joint(STORAGE_POSES_JOINTS[destination])
 
         move_gripper.gripper_open(self)
+        move_gripper.gripper_open(self)
         
         # if shelf, move back to the pre-place pose to avoid collisions and update the shelf layer occupation count
         if destination == 'shelf':
             self.shelf_layer_occupied[layer_idx] += 1
             self.arm.move_joint(PRE_SHELF_POSES_JOINTS[layer_idx])
+
 
         return True
 
@@ -414,7 +462,6 @@ class Orchestrator(Node):
             idx = self.select_home_pose(bl.position.y)
             located.append({'obj': det['object'].strip().lower(),
                             'y': bl.position.y, 'claimed': False, 'camera': 'wrist'})
-            self.get_logger().info(f"======={det['object']} belongs to the HOME_POSES[{idx}]======")
 
         # Pair each task with an unclaimed located object of the same type.
         plan, missed = [], []
@@ -464,45 +511,42 @@ class Orchestrator(Node):
 
         t0 = time.time()
 
-        # --- SURVEY ONCE from the scout pose ---------------------------------
-        plan, missed = self.coarse_survey(tasks)
+        for pass_idx in range(self.max_pick_passes):
+            # ----- 1. From the scout pose, detect objects -----
+            plan, missed = self.coarse_survey(tasks)
 
-        if missed:
-            self.get_logger().warn(
-                f'Not located at scout (will be skipped): {sorted(set(missed))}')
-        if not plan:
-            self.get_logger().warn('Nothing localized from scout; nothing to do.')
-            return
+            if missed:
+                self.get_logger().info(f'[Pass {pass_idx + 1}] not present at scout: {sorted(set(missed))}')
 
-        # Bucket order keeps same-home objects adjacent in the logs/run.
-        plan.sort(key=lambda tp: tp[1])
-        self.get_logger().info(
-            'Plan: ' + ', '.join(f"{t['object']}->HOME[{i}]" for t, i in plan))
-
-        # --- Pick each planned object from its assigned home pose ------------
-        for task, home_idx in plan:
-            if (time.time() - t0) >= self.time_budget:
-                self.get_logger().warn('Time budget exhausted; stopping.')
+            if not plan:
+                if pass_idx == 0:
+                    self.get_logger().warn('Nothing localized from scout; nothing to do.')
+                else:
+                    self.get_logger().info('All done! Re-scout found no remaining instructed objects.')
                 break
 
-            self.get_logger().info(f"=== {task['object']} -> {task['destination']} from HOME_POSES[{home_idx}] ===")
-            self.get_logger().info(f'Moving to HOME_POSES[{home_idx}]...')
-            self.arm.move_joint(HOME_POSES_JOINTS[home_idx])
+            plan.sort(key=lambda tp: tp[1])
+            self.get_logger().info(f'[Pass {pass_idx + 1}] Plan: ' + ', '.join(f"{t['object']}->HOME[{i}]" for t, i in plan))
 
-            # Fresh near-top-down localize for THIS object (accurate grasp pose).
-            pose_opt = self.detect_and_lift([task['object'].strip().lower()], [task])
-            if pose_opt is None:
-                self.get_logger().warn(
-                    f"Couldn't acquire {task['object']} from HOME_POSES[{home_idx}]; "
-                    'skipping (no re-scout in this design).')
-                continue
+            # ----- 2. Pick each planned object from its assigned home pose -----
+            for task, home_idx in plan:
+                self.get_logger().info(f"===== {task['object']} -> {task['destination']} from HOME_POSES[{home_idx}] =====")
+                self.arm.move_joint(HOME_POSES_JOINTS[home_idx])
 
-            # One attempt; not retried on failure (survey-once design).
-            self.grasp_and_place(pose_opt, task['destination'].strip().lower())
+                # Fresh near-top-down localize for THIS object (accurate grasp pose).
+                pose_opt = self.detect_and_lift([task['object'].strip().lower()], [task])
+                if pose_opt is None:
+                    self.get_logger().warn(
+                        f"Couldn't acquire {task['object']} from HOME_POSES[{home_idx}]; "
+                        'skipping (will be re-checked next pass).')
+                    continue
+
+                self.grasp_and_place(pose_opt, task['destination'].strip().lower())
+
+            self.move_to_scout()
 
         elapsed = time.time() - t0
         self.get_logger().info(f'Contest loop ended after {elapsed:.1f}s.')
-
 
 def main():
     rclpy.init()

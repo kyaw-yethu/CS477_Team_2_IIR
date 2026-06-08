@@ -28,6 +28,11 @@ from rclpy.node import Node
 from rclpy.qos import (QoSProfile, ReliabilityPolicy, HistoryPolicy,
                        DurabilityPolicy)
 from std_msgs.msg import String
+from sensor_msgs.msg import Image
+
+import numpy as np
+from PIL import Image as PILImage
+from cv_bridge import CvBridge
 
 # Either backend may be absent; import lazily so the node runs on whichever is
 # installed + keyed.
@@ -43,9 +48,10 @@ except ImportError:
     OpenAI = None
 
 
-SYSTEM_PROMPT = """You are a task parser for a robot pick-and-place system.
-You receive one natural-language instruction and must extract EVERY
-(object, destination) pair it contains.
+SYSTEM_PROMPT = """
+You are a task parser for a robot pick-and-place system. You receive one natural-language instruction and one image of objects to be picked. 
+Note that multiple instances of the same object category may be present in the workspace. So, carefully analyzing the instruction and the image, identify which 
+specific objects to pick and where to place them.
 
 Valid destinations are EXACTLY one of: "left_storage", "right_storage", "shelf".
 Map phrasing as follows:
@@ -56,10 +62,17 @@ Map phrasing as follows:
 Return ONLY a JSON object of the form:
 {"tasks": [{"object": "<name>", "destination": "<left_storage|right_storage|shelf>"}]}
 
+If there are multiple instances of the same object according to the instruction and the image, {"object": "<name>", "destination": "<left_storage|right_storage|shelf>"} must be repeated for each instance.
+
 Rules:
 - Use lowercase object names, e.g. "coke can", "meat can", "banana", "hammer".
 - One entry per (object, destination) occurrence.
-- No commentary, no markdown, JSON only."""
+- No commentary, no markdown, JSON only.
+- If the noun is plural, assume all instances of that object category are meant. 
+- If the noun is singular, assume only one instance is meant.
+- If the number of a particular object category is specified in the instruction, assume that exact number of instances are meant.
+- No ordering among objects should be assumed unless explicitly stated in the instruction.
+"""
 
 VALID_DEST = {"left_storage", "right_storage", "shelf"}
 
@@ -73,10 +86,12 @@ class InstructionParser(Node):
         # which raised whenever GEMINI_API_KEY was unset). Backend chosen below.
         self.declare_parameter('api_key', '')           # Gemini key (env wins)
         self.declare_parameter('openai_api_key', '')    # OpenAI key (env wins)
-        self.declare_parameter('model', 'gemini-2.5-flash-lite')
+        self.declare_parameter('model', 'gemini-3-flash-preview')
         self.declare_parameter('openai_model', 'gpt-4o-mini')
         self.declare_parameter('task_command_topic', '/task_commands')
         self.declare_parameter('parsed_tasks_topic', '/parsed_tasks')
+        self.declare_parameter('wrist_image_topic',
+                               '/wrist_camera/wrist_camera/color/image_raw')
         self.declare_parameter('temperature', 0.0)
 
         self.temperature = float(self.get_parameter('temperature').value)
@@ -133,6 +148,17 @@ class InstructionParser(Node):
         self.create_subscription(
             String, self.get_parameter('task_command_topic').value,
             self.on_command, cmd_qos)
+        
+        self.bridge = CvBridge()
+        self.latest_image = None
+        img_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        self.create_subscription(
+            Image, self.get_parameter('wrist_image_topic').value,
+            self.on_image, img_qos)
 
         self._busy = threading.Lock()
         self.get_logger().info(
@@ -158,6 +184,21 @@ class InstructionParser(Node):
         finally:
             self._busy.release()
 
+    def on_image(self, msg):
+        try:
+            self.latest_image = self.bridge.imgmsg_to_cv2(
+                msg, desired_encoding='bgr8')
+        except Exception as e:
+            self.get_logger().error(f'cv_bridge error: {e}')
+
+    def _latest_pil(self):
+        """Most recent wrist frame as a PIL RGB image, or None if none received."""
+        frame = self.latest_image
+        if frame is None:
+            return None
+        rgb = frame[:, :, ::-1]                      # BGR (cv_bridge) -> RGB
+        return PILImage.fromarray(np.ascontiguousarray(rgb))
+
     def parse(self, instruction):
         # Both backends are prompted to return the same JSON object; only the
         # raw-text generation differs. Validation below is shared.
@@ -178,9 +219,11 @@ class InstructionParser(Node):
         return tasks
 
     def _parse_gemini(self, instruction):
+        pil = self._latest_pil()
+        contents = [pil, instruction]
         response = self.client.models.generate_content(
             model=self.model,
-            contents=instruction,
+            contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
                 temperature=self.temperature,
@@ -194,7 +237,6 @@ class InstructionParser(Node):
         # SYSTEM_PROMPT already says "Return ONLY a JSON object", so it's covered.
         resp = self.client.chat.completions.create(
             model=self.model,
-            temperature=self.temperature,
             response_format={'type': 'json_object'},
             messages=[
                 {'role': 'system', 'content': SYSTEM_PROMPT},

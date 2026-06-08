@@ -103,7 +103,7 @@ class PerceptionNode(Node):
         self.declare_parameter('api_key', '')           # Gemini key (env wins)
         self.declare_parameter('openai_api_key', '')    # OpenAI key (env wins)
         self.declare_parameter('model', 'gemini-3-flash-preview')
-        self.declare_parameter('openai_model', 'gpt-5-mini')
+        self.declare_parameter('openai_model', 'gpt-5.4')
 
         # --- cameras --------------------------------------------------------
         # Topic + optical frame for each camera. The optical frame is what the
@@ -357,7 +357,6 @@ class PerceptionNode(Node):
         self.get_logger().info(f'Attempting detection with model: {self.model}')
         resp = self.client.chat.completions.create(
             model=self.model,
-            temperature=0.0,
             messages=[{
                 'role': 'user',
                 'content': [
@@ -376,7 +375,8 @@ class PerceptionNode(Node):
         names = ', '.join(classes)
         return (
             'Detect every instance of the following objects in the image: '
-            f'{names}. There can be one or several of each type. '
+            f'{names} ONLY INSIDE the Work Space (tray in the middle on top of the table) NOT on the shelf or anywhere else. '
+            'There can be one or several of each type. '
             'For EACH detected instance, output one list of the form '
             "[ymin, xmin, ymax, xmax, 'label'] using integer normalized "
             'coordinates in the range 0-1000, where label is copied EXACTLY '

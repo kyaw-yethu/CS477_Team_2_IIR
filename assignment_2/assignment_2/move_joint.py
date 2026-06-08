@@ -267,7 +267,7 @@ class ArmClient(Node):
         rclpy.spin_until_future_complete(self, goal_future)
 
         goal_handle = goal_future.result()
-        self.get_logger().info('goal_handle:\n {}'.format(goal_handle))
+        # self.get_logger().info('goal_handle:\n {}'.format(goal_handle))
     
         # Wait until the execution ends and return the result
         result_future = goal_handle.get_result_async()

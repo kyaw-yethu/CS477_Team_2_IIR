@@ -108,24 +108,48 @@ class GraspServerNode(Node):
         g[:, :-1] |= region[:, 1:]
         return g & mask
 
-    def _slab_blob_at_center(self, slab2d):
-        """Keep only the slab's connected component under the ROI centre pixel.
-        The bbox is centred on the target, so that blob IS the target; a neighbour
-        leaking into a corner forms a separate component and is dropped. Pure
-        numpy flood fill -- no scipy."""
+    def _components(self, mask):
+        """Label all 4-connected components of a bool mask. Returns a list of
+        (component_mask, pixel_count, bbox_area). Pure numpy, no scipy."""
+        remaining = mask.copy()
+        comps = []
+        while remaining.any():
+            ys, xs = np.nonzero(remaining)
+            region = np.zeros_like(mask)
+            region[int(ys[0]), int(xs[0])] = True
+            prev = -1
+            while region.sum() != prev:                 # flood fill this component
+                prev = int(region.sum())
+                region = self._grow(remaining, region)
+            ys, xs = np.nonzero(region)
+            bbox_area = (ys.max() - ys.min() + 1) * (xs.max() - xs.min() + 1)
+            comps.append((region, int(region.sum()), int(bbox_area)))
+            remaining &= ~region
+        return comps
+
+    def _select_target_blob(self, slab2d):
+        """Pick the slab component that is the detection's target. The bbox is
+        tight around the target, so the target's own bbox spans the whole ROI
+        while a neighbour only clips a corner/edge -- so choose the component
+        whose bbox fills the most of the ROI, and among comparable ones the most
+        central.
+
+        This replaces a centre-pixel seed, which fails for a thin diagonal object
+        (a hammer handle): its axis-aligned bbox centre sits in empty space and
+        can land on a neighbour (the strawberry beside the head)."""
+        comps = self._components(slab2d)
+        if len(comps) <= 1:
+            return comps[0][0] if comps else slab2d
         h, w = slab2d.shape
-        cy, cx = h // 2, w // 2
-        if not slab2d[cy, cx]:                 # centre in a hole -> nearest slab pixel
-            ys, xs = np.nonzero(slab2d)
-            k = int(np.argmin((ys - cy) ** 2 + (xs - cx) ** 2))
-            cy, cx = int(ys[k]), int(xs[k])
-        region = np.zeros_like(slab2d)
-        region[cy, cx] = True
-        prev = -1
-        while region.sum() != prev:            # monotone growth -> terminates
-            prev = int(region.sum())
-            region = self._grow(slab2d, region)
-        return region
+        cy, cx = h / 2.0, w / 2.0
+        max_bbox = max(bbox for _, _, bbox in comps)
+        cand = [c for c in comps if c[2] >= 0.7 * max_bbox and c[1] >= 20] or comps
+
+        def off_center(comp):
+            ys, xs = np.nonzero(comp[0])
+            return (ys.mean() - cy) ** 2 + (xs.mean() - cx) ** 2
+
+        return min(cand, key=off_center)[0]
 
     def _grasp_center(self, points, yaw):
         """On-object grasp point. np.mean() lands in the hollow of a curved object
@@ -318,8 +342,8 @@ class GraspServerNode(Node):
             self.get_logger().info("No points!!!!!!!!!!!!!!!!")
             return None
 
-        # 3b. Keep only the slab blob under the bbox centre.
-        slab2d = self._slab_blob_at_center(slab2d)
+        # 3b. Pick the component that is the detector's target (its bbox fills the ROI), not whatever happens to sit at the geometric centre.
+        slab2d = self._select_target_blob(slab2d)
         target_points = roi_cloud[slab2d]
 
         # 4. Long axis (PCA) + an ON-OBJECT centre.
