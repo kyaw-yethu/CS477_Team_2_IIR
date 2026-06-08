@@ -10,7 +10,10 @@
 frames.pdf
 frames.gv
 *.jpeg
-
+.env
+.venv
+team_2/detections/*
+team_2/debug/*
 # ROS specific files and folders #
 ##################################
 build

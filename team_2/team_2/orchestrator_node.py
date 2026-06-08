@@ -1,43 +1,6 @@
 #!/usr/bin/env python3
 """
 orchestrator_node.py
-
-The ONLY node that commands the arm. Everything else (perception, 3D lift) is a
-service it calls. This is what makes the architecture safe: one owner of the
-controller, so two nodes never fight over trajectories.
-
-Flow (this is the competition flow):
-
-    STANDBY  ── wait for one /task_commands-derived message on /parsed_tasks
-       │         (latched, so a parser that published first still reaches us)
-       ▼
-    LOOP while tasks remain and time budget left:
-       move arm to SCOUT_POSE  (oblique view — the whole point: classify from
-                                a viewpoint that shows labels/shape, not top-down)
-       ── call 'detect_objects'      (perception service, 2D boxes)
-       ── pick the best detection that matches a remaining task
-       ── call 'lift_bbox_to_3d'     (grasp-server service, bbox -> 3D Pose in
-                                       wrist_camera_color_optical_frame)
-       ── TF that pose into base_link, then grasp + place at the task's storage
-       ── drop the completed task
-
-Concurrency model: SINGLE-THREADED, on-demand spin — exactly like
-example5_grasp_client. We are NOT continuously spun by an executor, so blocking
-service/action calls (spin_until_future_complete, ArmClient's internal spins)
-don't deadlock. The only place we must spin manually is while waiting for TF.
-
-============================  SEAMS YOU MUST FILL  ============================
-  1. SCOUT_POSE      — six joint angles for the oblique scouting view. Find them
-                       by jogging the arm and reading get_joint.get_joint_angles.
-  2. HOME_POSE       — optional safe start pose.
-  3. PLACE_POSES     — a joint config per destination string where the arm opens
-                       the gripper to drop the object.
-  4. The import of ArmClient / move_gripper — point these at whatever your
-     WORKING grasp code uses. example5 uses `assignment_2.move_joint.ArmClient`
-     and `manip_challenge.move_gripper`; example1 uses `manip_challenge.move_*`.
-  5. 'lift_bbox_to_3d' service — see note at bottom; it's a ~6-line change to
-     example5_grasp_server (strip Gemini, read bbox from request.data).
-==============================================================================
 """
 import copy
 import json
@@ -54,7 +17,7 @@ from geometry_msgs.msg import PoseStamped
 
 from tf2_ros import (Buffer, TransformListener, LookupException,
                      ConnectivityException, ExtrapolationException)
-import tf2_geometry_msgs  # noqa: F401  (registers Pose transforms with tf2)
+import tf2_geometry_msgs
 
 from team_2_interfaces.srv import DetectObjects
 from riro_srvs.srv import StringPose          # reused for the bbox -> 3D lift
@@ -64,7 +27,23 @@ from assignment_2 import move_joint as mj      # provides ArmClient
 from manip_challenge import move_gripper
 # -----------------------------------------------------------------------------
 import math
-from geometry_msgs.msg import Pose
+from geometry_msgs.msg import Pose, Quaternion
+from manip_challenge import get_joint 
+
+def quat_mul(a, b):
+    """Hamilton product a ⊗ b (ROS x,y,z,w convention)."""
+    q = Quaternion()
+    q.w = a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z
+    q.x = a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y
+    q.y = a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x
+    q.z = a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w
+    return q
+
+def quat_about_z(angle):
+    q = Quaternion()
+    q.z = math.sin(angle/2.0)
+    q.w = math.cos(angle/2.0)
+    return q
 
 def make_pose(x, y, z, roll, pitch, yaw):
     """(x,y,z) metres, (roll,pitch,yaw) radians, all in base_link."""
@@ -78,17 +57,61 @@ def make_pose(x, y, z, roll, pitch, yaw):
     p.orientation.z = cr * cp * sy - sr * sp * cy
     p.orientation.w = cr * cp * cy + sr * sp * sy
     return p
+# --- POSITIONS ----------------------------------------------------------------
+# x, y, z, roll, pitch, yaw (radians)
+HOME_POSES = [
+    (0.55,  0.4, 0.60, -math.pi, 0.0, 0.0),
+    (0.55,  0.05, 0.60, -math.pi, 0.0, 0.0),
+    (0.55, -0.20, 0.60, -math.pi, 0.0, 0.0),
+]
+
+# SCOUT_POSE   = (-0.20, -0.05, 0.45, 3 * math.pi/4, 0.0, math.pi/2)
+
+# PRE_SHELF_POSES = [
+#     (1.15, 0.3, 0.05, math.pi/2, 0.0, 0.0),
+#     (1.15, 0.3, 0.30, math.pi/2, 0.0, 0.0),
+#     (0.60, -0.33, 0.50, math.pi/2, 0.0, math.pi/2)
+# ]
 
 
-# --- SEAM 1/2/3: fill with real values ---------------------------------------
-#                x     y     z     roll      pitch  yaw
-HOME_POSE  = (0.0, 0.0, 0.6, math.pi,   0.0,   0.0)   # oblique view, tune
-SCOUT_POSE   = (-0.20, 0.0, 0.55, math.pi,   -1.0,   0.0)
-PLACE_POSES = {
-    'left storage':  (0.40,  0.30, 0.30, math.pi, 0.0, 0.0),
-    'right storage': (0.40, -0.30, 0.30, math.pi, 0.0, 0.0),
-    'shelf':         (0.45,  0.00, 0.50, math.pi, 0.0, 0.0),
-}
+# POST_SHELF_POSES = [
+#     (1.15, -0.32, 0.025, math.pi/2+0.3, 0.0, 0.0),
+#     (1.15, -0.32, 0.28, math.pi/2+0.3, 0.0, 0.0),
+#     (1.00, -0.33, 0.52, math.pi/2+0.4, 0.0, math.pi/2)
+# ]
+
+
+# STORAGE_POSES = {
+#     'left_storage':  (-0.05,  0.60, 0.25, math.pi, 0.0, 0.0),
+#     'right_storage': (-0.05, -0.60, 0.25, math.pi, 0.0, 0.0)
+# }
+
+HOME_POSES_JOINTS = [
+                [0.4486239282397744, -0.919427693246301, -0.0009643325054386759, -0.6664451503075698, -1.5698670094956702, 2.0186363613790976],
+                [-0.09760216271339925, -1.041465208208678, 0.007976593885553171, -0.5451334190770651, -1.570210237498598, 1.4776046285377251],
+                [-0.5355024046855043, -1.0059814986612452, 0.002029311252828683, -0.5756700956254002, -1.5698330212301568, 1.0396796225880653]
+            ]         
+SCOUT_POSE_JOINTS = [0.017202321595274267, -2.8693023874037227, 1.4228273057359349, -0.9013666354949029, -1.5966035125312512, 0.012271264979222866]
+
+STORAGE_POSES_JOINTS = {
+                    'left_storage': [1.3262682423335923, -1.5261878782927405, 1.5006351440038201, -1.5529224614769819, -1.5643691270548534, 2.868371580877126],
+                    'right_storage': [-1.7741962334802774, -1.4659544651890226, 1.4349766582912324, -1.5319499488171424, -1.576430258078094, -0.20136340291521987]
+                    }
+# 
+
+PRE_SHELF_POSES_JOINTS = [
+                    [0.17285882419207604, 0.009414032585641493, 0.04142618024092783, -1.2309130438531848, -3.1167689924260484, 1.9431021777750577],
+                    [0.1868212461565257, -0.21137538666348565, -0.022417456928694304, -1.3048437797960213, -3.113571353761288, 1.609871180198019],
+                    [-0.9110161564253627, -1.4206915427165185, 1.4838585428541253, -3.135808794737544, -0.6651189437124587, -0.0566975763987704]
+                ]
+
+POST_SHELF_POSES_JOINTS = [
+    [-0.13535970323704163, 0.023049948383443927, -0.04203316177540594, -1.750520392646267, -2.850942302274265, 1.3479522636327192],
+    [-0.1582175292289698, -0.20618354710604558, -0.0364649370185775, -1.6509244782416772, -2.8357651870951144, 1.2233524083046359],
+    [-0.5504861307885196, -0.6772529340569791, 0.37828048434279177, -2.39458452572829, -1.0650724776737845, -0.22683857683566672]
+]
+
+GRIPPER_YAW_OFFSET = math.pi / 2.0
 # -----------------------------------------------------------------------------
 
 
@@ -99,18 +122,15 @@ class Orchestrator(Node):
         self.declare_parameter('parsed_tasks_topic', '/parsed_tasks')
         self.declare_parameter('detect_service', 'detect_objects')
         self.declare_parameter('lift_service', 'lift_bbox_to_3d')
-        self.declare_parameter('camera_optical_frame',
-                               'wrist_camera_color_optical_frame')
+        self.declare_parameter('camera_optical_frame', 'wrist_camera_color_optical_frame')
         self.declare_parameter('base_frame', 'base_link')
-        self.declare_parameter('settle_sec', 0.8)   # let the camera stream catch
-        #                                              up to the new arm pose
-        # NOTE: protocol PDF says 5 min, README says 8 min. Confirm with the TA.
-        self.declare_parameter('time_budget_sec', 300.0)
+        self.declare_parameter('max_pick_passes', 3)
+        self.declare_parameter('elbow_floor_z', 0.20)
 
         self.optical_frame = self.get_parameter('camera_optical_frame').value
         self.base_frame = self.get_parameter('base_frame').value
-        self.settle = float(self.get_parameter('settle_sec').value)
-        self.time_budget = float(self.get_parameter('time_budget_sec').value)
+        self.max_pick_passes = int(self.get_parameter('max_pick_passes').value) 
+        self.elbow_floor_z = float(self.get_parameter('elbow_floor_z').value)  # <-- add
 
         self.tasks = None  # set when /parsed_tasks arrives -> leaves standby
 
@@ -122,10 +142,8 @@ class Orchestrator(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # Service clients.
-        self.detect_cli = self.create_client(
-            DetectObjects, self.get_parameter('detect_service').value)
-        self.lift_cli = self.create_client(
-            StringPose, self.get_parameter('lift_service').value)
+        self.detect_cli = self.create_client(DetectObjects, self.get_parameter('detect_service').value)
+        self.lift_cli = self.create_client(StringPose, self.get_parameter('lift_service').value)
 
         # Latched subscription so a parser that published before we were up
         # still delivers (TRANSIENT_LOCAL must match the parser's publisher QoS).
@@ -135,11 +153,12 @@ class Orchestrator(Node):
             depth=1,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
-        self.create_subscription(
-            String, self.get_parameter('parsed_tasks_topic').value,
-            self.on_tasks, tasks_qos)
+        self.create_subscription(String, self.get_parameter('parsed_tasks_topic').value, self.on_tasks, tasks_qos)
 
         self.get_logger().info('orchestrator_node: created.')
+
+        self.shelf_layer_occupied = [0, 0, 0] # there are three layers on the shelf, track how many objects are in each to know where to place the next one
+
 
     # ---- standby trigger ----------------------------------------------------
     def on_tasks(self, msg):
@@ -155,9 +174,10 @@ class Orchestrator(Node):
             while rclpy.ok() and not cli.wait_for_service(timeout_sec=1.0):
                 self.get_logger().info(f"Waiting for '{name}' service...")
 
-    def call_perception(self, names):
+    def call_perception(self, names, camera='wrist'):
+        """Request detection from specified camera ('wrist' or 'scene')."""
         req = DetectObjects.Request()
-        req.data = json.dumps(names)
+        req.data = json.dumps({'classes': names, 'camera': camera})
         fut = self.detect_cli.call_async(req)
         rclpy.spin_until_future_complete(self, fut)
         res = fut.result()
@@ -183,6 +203,33 @@ class Orchestrator(Node):
         if p.position.x == 0.0 and p.position.y == 0.0 and p.position.z == 0.0:
             return None
         return p
+
+    def detect_and_lift(self, names, candidate_tasks):
+        """One detect -> pick -> lift -> TF-to-base_link cycle from the CURRENT
+        arm pose.
+
+        Returns (det, task, pose_opt, obj_bl) or None on any failure.
+          pose_opt : Pose in the camera optical frame (what grasp_and_place wants;
+                     its .orientation carries the OBB long-axis from grasp_server)
+          obj_bl   : same point in base_link (for the home-bucket decision/debug)
+        """
+        dets = self.call_perception(names)
+        if not dets:
+            self.get_logger().warn('No detections.')
+            return None
+
+        pair = self.pick_target(dets, candidate_tasks)
+        if pair is None:
+            self.get_logger().warn('No detection matched a candidate task.')
+            return None
+        det, task = pair
+
+        pose_opt = self.call_lift(det['bbox'])
+        if pose_opt is None:
+            self.get_logger().warn('Lift-to-3D failed (no valid depth in bbox).')
+            return None
+
+        return pose_opt
 
     # ---- TF -----------------------------------------------------------------
     def transform_pose(self, pose, source_frame, target_frame):
@@ -222,110 +269,291 @@ class Orchestrator(Node):
                         best = (det, task)
         return best
 
-    # ---- arm motions (sole owner) -------------------------------------------
-    def goto_scout(self):
-        self.arm.move_pose(make_pose(*SCOUT_POSE))
-        time.sleep(self.settle)
+    @staticmethod
+    def select_home_pose(obj_y):
+        """Index of the HOME_POSE whose y is nearest the object's y, so the wrist
+        camera ends up looking roughly straight down at the target."""
+        ys = [p[1] for p in HOME_POSES]
+        return min(range(len(HOME_POSES)), key=lambda i: abs(ys[i] - obj_y))
+
+    # ---- OBB orientation -> gripper yaw -------------------------------------
+    def _oriented_grasp_yaw(self, pose_opt):
+        """Decode the object's long-axis angle (grasp_server packs it into
+        pose_opt.orientation as a rotation about optical +Z), snap to one of four
+        image-space buckets, and return (bucket_name, wrist3_delta_rad).
+        """
+        q = pose_opt.orientation
+        angle = 2.0 * math.atan2(q.z, q.w)        # long-axis angle in optical XY
+        a = angle % math.pi
+        cats = [(0.0,               'horizontal'),
+                (math.pi / 4.0,     'left-to-right'),
+                (math.pi / 2.0,     'vertical'),
+                (3 * math.pi / 4.0, 'right-to-left')]
+
+        def circ(x, b):
+            d = abs(x - b) % math.pi
+            return min(d, math.pi - d)
+
+        a_snap, name = min(cats, key=lambda c: circ(a, c[0]))
+
+        # Across the long axis (+offset), folded into (-pi/2, pi/2] so the wrist
+        # takes the short way round (jaws are symmetric under 180 deg -> no joint-limit swings).
+        delta = a_snap + GRIPPER_YAW_OFFSET
+        delta = (delta + math.pi / 2.0) % math.pi - math.pi / 2.0
+
+        self.get_logger().info(f'OBB: {name} -> wrist_3 += {math.degrees(delta):+.0f} deg')
+
+        return delta
+
+    # ---- arm moves ----------------------------------------------------------        
+    def move_to_scout(self):
+        self.get_logger().info('Moving to SCOUT pose...')
+        self.arm.move_joint(SCOUT_POSE_JOINTS)
+
+    def rotate_gripper(self, angle):
+        self.get_logger().info(f'Rotating gripper by {math.degrees(angle):.0f} deg...')
+        cur = list(get_joint.get_joint_angles(self))
+        cur[5] += angle
+        self.arm.move_joint(cur)
+
+    def move_pose_by_joints(self, target):
+        """Move the EE to `target` in joint space on the elbow-up branch."""
+        q = self._solve_ik_elbow_up(target)
+        if q is None:
+            return False
+        self.arm.move_joint(q)
+        return True
+
+    def _forearm_z(self, q):
+        """Elbow height (forearm_link origin z) in base_link at config q, via
+        the arm's own KDL chain -- this is what distinguishes the UR5's
+        elbow-up branch from the elbow-down one that drives the forearm into
+        the table."""
+        try:
+            T = np.asarray(self.arm.arm_kdl.forward(q, end_link='forearm_link'))
+            return float(T[2, 3])
+        except Exception as e:
+            self.get_logger().warn(f'_forearm_z: FK to forearm_link failed ({e}).')
+            return None   # can't gate -> caller trusts the raw solve
+
+    def _solve_ik_elbow_up(self, target):
+        """Joints that reach `target` on the elbow-UP branch. pose_to_joints
+        lands on whatever branch its seed + Cartesian path drift into, so we
+        solve, FK-check the elbow, and on a fold retry from seeds biased toward
+        elbow-up (and finally the curated HOME configs). Returns elbow-up
+        joints, or None if no seed produced one."""
+        cur = list(get_joint.get_joint_angles(self))
+
+        seeds = [cur]
+        for d in (0.4, 0.8):                 # shoulder_lift up + elbow folded in
+            s = list(cur); s[1] -= d; s[2] += d
+            seeds.append(s)
+        seeds.extend(HOME_POSES_JOINTS)      # known elbow-up fallbacks
+
+        best = None
+        for seed in seeds:
+            q = self.arm.pose_to_joints(target, q_seed=seed)
+            if q is None:
+                continue
+            z = self._forearm_z(q)
+            if z is None:                    # FK gate unavailable -> trust solve
+                return q
+            if best is None:
+                best = (q, z)
+            if z >= self.elbow_floor_z:
+                self.get_logger().info(f'IK elbow-up: forearm z={z:.3f}')
+                return q
+        if best is not None:
+            self.get_logger().warn(
+                f'IK: no elbow-up branch (best forearm z={best[1]:.3f} '
+                f'< floor={self.elbow_floor_z:.3f}).')
+        return None
 
     def grasp_and_place(self, obj_pose_optical, destination):
         """Adapted from example5 ObjectGraspClient.request_pick, plus a
         destination-aware place."""
         move_gripper.gripper_open(self)
 
-        # Borrow a downward gripper orientation from FK of a known-good config.
-        pose_bl_to_gripper = self.arm.fk_request(
-            [0.0, -np.pi / 2.0, 1.0, -np.pi / 3.0, -np.pi / 2.0, 0.0])
-
         if not self.wait_for_tf():
             self.get_logger().error('TF never became available.')
             return False
-        obj_bl = self.transform_pose(
-            obj_pose_optical, self.optical_frame, self.base_frame)
-        if obj_bl is None:
-            return False
 
+        neutral_opt = Pose()
+        neutral_opt.position = obj_pose_optical.position
+        neutral_opt.orientation.w = 1.0          # identity: no long-axis spin
+        obj_bl = self.transform_pose(neutral_opt, self.optical_frame, self.base_frame)
+
+        # ---1. approach---
         goal = copy.copy(obj_bl)
-        goal.orientation = pose_bl_to_gripper.orientation
-
-        # 1. approach from above
-        goal.position.y -= 0.01
         goal.position.z += 0.10
-        self.arm.move_pose(goal)
-        # 2. descend onto the object
-        goal.position.z -= 0.11
-        self.arm.move_pose(goal)
-        # 3. grasp
-        move_gripper.gripper_close(self, force=0.5, gripper_close_pos=0.5)
-        # 4. lift clear
-        goal.position.z += 0.20
-        self.arm.move_pose(goal)
-        # 5. carry to the storage and release
-        place = PLACE_POSES.get(destination.strip().lower())
-        if place is None:
-            self.get_logger().warn(f"No place pose for destination '{destination}'; releasing in place.")
+        self.move_pose_by_joints(goal)
+            
+        # ---2. spin the jaws of the gripper in place---
+        self.rotate_gripper(self._oriented_grasp_yaw(obj_pose_optical))
+
+        # ---3. descend, keeping the rotated orientation---
+        cur = list(get_joint.get_joint_angles(self))
+        goal.orientation = self.arm.fk_request(cur).orientation
+        goal.position.z -= 0.12
+        self.move_pose_by_joints(goal)
+
+        # ---4. grasp---
+        move_gripper.gripper_close(self, force=0.5, gripper_close_pos=0.55)
+
+        # ---5. lift up to the HOME POSE 1---
+        self.arm.move_joint(HOME_POSES_JOINTS[1]) # move to a middle home pose before going to the shelf to avoid collisions with the shelf when moving from the lift pose
+
+        # ---6. carry to the storage and release---
+        if destination == 'shelf':
+            # calculate which layer of the shelf to place on based on how many objects are already there
+            min_count = min(self.shelf_layer_occupied)
+            layer_idx = next(
+                idx for idx in reversed(range(len(self.shelf_layer_occupied)))
+                if self.shelf_layer_occupied[idx] == min_count
+            )
+            self.arm.move_joint(PRE_SHELF_POSES_JOINTS[layer_idx]) # move to the pre-place pose for the correct layer
+            self.arm.move_joint(POST_SHELF_POSES_JOINTS[layer_idx]) # move to the place pose for the correct layer
         else:
-            self.arm.move_pose(make_pose(*place))
+            self.arm.move_joint(STORAGE_POSES_JOINTS[destination])
+
         move_gripper.gripper_open(self)
+        move_gripper.gripper_open(self)
+        
+        # if shelf, move back to the pre-place pose to avoid collisions and update the shelf layer occupation count
+        if destination == 'shelf':
+            self.shelf_layer_occupied[layer_idx] += 1
+            self.arm.move_joint(PRE_SHELF_POSES_JOINTS[layer_idx])
+
+
         return True
 
-    # ---- main loop ----------------------------------------------------------
-    # def move_home_pose(self):
-    #     self.get_logger().info('Moving to home pose....')
-    #     self.arm.move_pose(make_pose(*HOME_POSE))
+    # ---- one-time survey ----------------------------------------------------
+    def coarse_survey(self, tasks):
+        """From the CURRENT (scout) pose, detect every requested object type once,
+        lift each detection to a rough base_link position, and assign each task to
+        the nearest-in-y HOME_POSES bucket.
 
+        If objects are missed on primary wrist-camera scout, try secondary detection
+        using the scene (overhead) camera from the same arm position for better accuracy.
+
+        Returns (plan, missed):
+          plan   : list of (task, home_idx), one per task we could place a bucket on
+          missed : list of object names a task wanted but the scout never located
+
+        We only keep the base_link y here (time-invariant, safe to remember).
+        The actual grasp pose is re-measured later at the home pose, NOT reused
+        from this survey -- an optical-frame pose from scout is meaningless once
+        the arm has moved.
+        """
+        names = sorted({t['object'].strip().lower() for t in tasks})
+        
+        # Primary detection: wrist camera from scout pose (oblique angle)
+        dets = self.call_perception(names, camera='wrist')
+
+        # Lift each detection once -> a located physical object with a coarse y.
+        located = []   # [{'obj': str, 'y': float, 'claimed': bool, 'camera': str}, ...]
+        for det in dets:
+            pose_opt = self.call_lift(det['bbox'])
+            if pose_opt is None:
+                continue
+            bl = self.transform_pose(pose_opt, self.optical_frame, self.base_frame)
+            if bl is None:
+                continue
+            idx = self.select_home_pose(bl.position.y)
+            located.append({'obj': det['object'].strip().lower(),
+                            'y': bl.position.y, 'claimed': False, 'camera': 'wrist'})
+
+        # Pair each task with an unclaimed located object of the same type.
+        plan, missed = [], []
+        for task in tasks:
+            obj = task['object'].strip().lower()
+            cand = next((L for L in located if not L['claimed'] and L['obj'] == obj), None)
+            if cand is None:
+                missed.append(obj)
+                continue
+            cand['claimed'] = True
+            plan.append((task, self.select_home_pose(cand['y'])))
+        
+        # If we missed objects, try secondary detection using scene camera (overhead view, same arm position)
+        if missed:
+            self.get_logger().info(f'Attempting secondary scout (scene camera) for missed: {missed}')
+            dets_scene = self.call_perception(missed, camera='scene')
+            
+            for det in dets_scene:
+                obj_lower = det['object'].strip().lower()
+                # Skip if already located at primary scout (wrist camera).
+                if any(L['obj'] == obj_lower and not L['claimed'] for L in located):
+                    continue
+                    
+                pose_opt = self.call_lift(det['bbox'])
+                if pose_opt is None:
+                    continue
+                bl = self.transform_pose(pose_opt, self.optical_frame, self.base_frame)
+                if bl is None:
+                    continue
+                idx = self.select_home_pose(bl.position.y)
+                located.append({'obj': obj_lower, 'y': bl.position.y, 'claimed': False, 'camera': 'scene'})
+                self.get_logger().info(
+                    f'[SCENE CAMERA] {det["object"]} -> HOME[{idx}] (confidence: {det.get("conf", "N/A")})')
+                # Retry plan for this object.
+                for task in tasks:
+                    if task['object'].strip().lower() == obj_lower:
+                        missed.remove(obj_lower) if obj_lower in missed else None
+                        plan.append((task, idx))
+                        break
+        
+        return plan, missed
+
+    # ---- main loop ----------------------------------------------------------
     def run_contest(self):
         raw = self.tasks
         tasks = raw['tasks'] if isinstance(raw, dict) and 'tasks' in raw else raw
-        remaining = list(tasks)
-        self.get_logger().info(
-            f'Leaving STANDBY. {len(remaining)} task(s): {remaining}')
 
-        self.arm.move_pose(make_pose(*HOME_POSE))
         t0 = time.time()
 
-        while remaining and (time.time() - t0) < self.time_budget:
-            self.goto_scout()
+        for pass_idx in range(self.max_pick_passes):
+            # ----- 1. From the scout pose, detect objects -----
+            plan, missed = self.coarse_survey(tasks)
 
-            names = sorted({t['object'].strip().lower() for t in remaining})
-            dets = self.call_perception(names)
-            if not dets:
-                self.get_logger().warn(
-                    'No detections from scout view; stopping. '
-                    '(Add an alternate scout pose here to retry.)')
+            if missed:
+                self.get_logger().info(f'[Pass {pass_idx + 1}] not present at scout: {sorted(set(missed))}')
+
+            if not plan:
+                if pass_idx == 0:
+                    self.get_logger().warn('Nothing localized from scout; nothing to do.')
+                else:
+                    self.get_logger().info('All done! Re-scout found no remaining instructed objects.')
                 break
 
-            pair = self.pick_target(dets, remaining)
-            if pair is None:
-                self.get_logger().warn(
-                    'No detection matched a remaining task; stopping.')
-                break
-            det, task = pair
-            self.get_logger().info(
-                f"Target: {task['object']} -> {task['destination']} "
-                f"(conf {det['conf']:.2f}, bbox {det['bbox']})")
+            plan.sort(key=lambda tp: tp[1])
+            self.get_logger().info(f'[Pass {pass_idx + 1}] Plan: ' + ', '.join(f"{t['object']}->HOME[{i}]" for t, i in plan))
 
-            pose_opt = self.call_lift(det['bbox'])
-            if pose_opt is None:
-                # No depth in this box (often a bad/edge detection). Skip this
-                # detection and re-scout rather than risk a blind grasp.
-                self.get_logger().warn('Lift-to-3D failed; re-scouting.')
-                continue
+            # ----- 2. Pick each planned object from its assigned home pose -----
+            for task, home_idx in plan:
+                self.get_logger().info(f"===== {task['object']} -> {task['destination']} from HOME_POSES[{home_idx}] =====")
+                self.arm.move_joint(HOME_POSES_JOINTS[home_idx])
 
-            if self.grasp_and_place(pose_opt, task['destination']):
-                remaining.remove(task)
+                # Fresh near-top-down localize for THIS object (accurate grasp pose).
+                pose_opt = self.detect_and_lift([task['object'].strip().lower()], [task])
+                if pose_opt is None:
+                    self.get_logger().warn(
+                        f"Couldn't acquire {task['object']} from HOME_POSES[{home_idx}]; "
+                        'skipping (will be re-checked next pass).')
+                    continue
+
+                self.grasp_and_place(pose_opt, task['destination'].strip().lower())
+
+            self.move_to_scout()
 
         elapsed = time.time() - t0
-        self.get_logger().info(
-            f'Contest loop ended after {elapsed:.1f}s. '
-            f'{len(remaining)} task(s) left.')
-
+        self.get_logger().info(f'Contest loop ended after {elapsed:.1f}s.')
 
 def main():
     rclpy.init()
     node = Orchestrator()
     node.wait_for_services()
 
-    # node.move_home_pose()
+    node.move_to_scout()   
 
     node.get_logger().info('STANDBY: waiting for /parsed_tasks ...')
     while rclpy.ok() and node.tasks is None:

@@ -132,7 +132,67 @@ class ArmClient(Node):
             self.js_joint_position = list(msg.actual.positions)
         ## self.js_lock.release()
 
+    def pose_to_joints(self, pose, q_seed=None, attach_tool=True,
+                    n_interp=60, refine_iters=150,
+                    tol_pos=2e-3, tol_rot=2e-2, damp=0.05):
+        if q_seed is None:
+            q_seed = self.js_joint_position
+        if q_seed is None:
+            self.get_logger().error('pose_to_joints: no joint seed.'); return None
+        if attach_tool:
+            pose = self.detachTool(pose)
 
+        gf = misc.pose2KDLframe(pose)
+        p_goal = np.array([gf.p[0], gf.p[1], gf.p[2]])
+        R_goal = np.array([[gf.M[i, j] for j in range(3)] for i in range(3)])
+
+        def fk(q):
+            T = np.asarray(self.arm_kdl.forward(q)); return T[:3, :3], T[:3, 3]
+        def ang_err(Rd, Rc):
+            E = Rd @ Rc.T
+            return 0.5*np.array([E[2,1]-E[1,2], E[0,2]-E[2,0], E[1,0]-E[0,1]])
+        def so3_log(R):
+            c = np.clip((np.trace(R)-1.0)/2.0, -1.0, 1.0); th = np.arccos(c)
+            if th < 1e-9: return np.zeros(3)
+            return th/(2.0*np.sin(th))*np.array([R[2,1]-R[1,2], R[0,2]-R[2,0], R[1,0]-R[0,1]])
+        def so3_exp(w):
+            th = np.linalg.norm(w)
+            if th < 1e-9: return np.eye(3)
+            k = w/th; K = np.array([[0,-k[2],k[1]],[k[2],0,-k[0]],[-k[1],k[0],0]])
+            return np.eye(3)+np.sin(th)*K+(1-np.cos(th))*(K@K)
+        def step(q, ep, ew):
+            e = np.concatenate([ep, ew]).reshape(6, 1)
+            J = np.asarray(self.arm_kdl.jacobian(q))
+            return q + (J.T @ np.linalg.inv(J@J.T + damp**2*np.eye(6)) @ e)[:, 0]
+
+        q = np.array(q_seed, dtype=float)
+        R0, p0 = fk(q)
+        dR = so3_log(R0.T @ R_goal)
+        for i in range(1, n_interp+1):
+            s = i/float(n_interp)
+            Rc, pc = fk(q)
+            q = step(q, ((1-s)*p0 + s*p_goal) - pc, ang_err(R0 @ so3_exp(s*dR), Rc))
+
+        best_q, best = q.copy(), 1e9
+        for _ in range(refine_iters):
+            Rc, pc = fk(q)
+            ep, ew = p_goal - pc, ang_err(R_goal, Rc)
+            c = np.linalg.norm(ep) + np.linalg.norm(ew)
+            if c < best: best, best_q = c, q.copy()
+            if np.linalg.norm(ep) < tol_pos and np.linalg.norm(ew) < tol_rot:
+                self.get_logger().warn(
+                    f'IK CONVERGED |ep|={np.linalg.norm(ep)*1000:.1f}mm '
+                    f'|ew|={np.degrees(np.linalg.norm(ew)):.2f}deg')
+                return [float(v) for v in q]
+            q = step(q, ep, ew)
+
+        Rc, pc = fk(best_q)
+        self.get_logger().warn(
+            f'IK STUCK best |ep|={np.linalg.norm(p_goal-pc)*1000:.1f}mm '
+            f'|ew|={np.degrees(np.linalg.norm(ang_err(R_goal, Rc))):.2f}deg -> None, caller falls back')
+        return None
+
+    
     def fk_request(self, joints, attach_tool=True):
         """ 
         A function to compute forward kinematics.
@@ -207,7 +267,7 @@ class ArmClient(Node):
         rclpy.spin_until_future_complete(self, goal_future)
 
         goal_handle = goal_future.result()
-        self.get_logger().info('goal_handle:\n {}'.format(goal_handle))
+        # self.get_logger().info('goal_handle:\n {}'.format(goal_handle))
     
         # Wait until the execution ends and return the result
         result_future = goal_handle.get_result_async()
@@ -274,8 +334,8 @@ class ArmClient(Node):
         
         # Get a start pose 
         start_pose = self.fk_request(self.js_joint_position, attach_tool=True)
-        print(f"start_pose: {start_pose}")
-        print(f"goal_pose: {goal_pose}")
+        # print(f"start_pose: {start_pose}")
+        # print(f"goal_pose: {goal_pose}")
         # Get a sequence of path variables from the min jerk trajectory planning
         time, progress, _, _, _, = mj.min_jerk([0], [1], duration)
 
@@ -363,8 +423,8 @@ class ArmClient(Node):
         # Get a start pose 
         start_pose = self.fk_request(self.js_joint_position, attach_tool=True)
 
-        print(f"start_pose: {start_pose}")
-        print(f"goal_pose: {goal_pose}")
+        # print(f"start_pose: {start_pose}")
+        # print(f"goal_pose: {goal_pose}")
 
         # Get a sequence of path variables from the min jerk trajectory planning
         time, progress, _, _, _, = mj.min_jerk([0], [1], duration)
